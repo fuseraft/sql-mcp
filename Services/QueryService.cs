@@ -1,11 +1,11 @@
-using McpServer.Models;
+using SqlMcp.Models;
 using Microsoft.Extensions.Configuration;
 using System.Data;
 using System.Data.Common;
 using System.Linq;
 using System.Collections.Generic;
 
-namespace McpServer.Services;
+namespace SqlMcp.Services;
 
 public class QueryService
 {

@@ -1,5 +1,5 @@
-using McpServer.Models;
-using McpServer.Services;
+using SqlMcp.Models;
+using SqlMcp.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 

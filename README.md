@@ -1,6 +1,6 @@
-# McpServer
+# sql-mcp
 
-McpServer is a lightweight .NET Minimal API server for AI agents in the FuseRaft orchestration framework. It proxies SQL queries to multiple databases securely, using env vars for credentials.
+sql-mcp is a lightweight .NET Minimal API server for AI agents in the FuseRaft orchestration framework. It proxies SQL queries to multiple databases securely, using env vars for credentials.
 
 ## Supported Databases
 - SQL Server (e.g., `samplesql`)
@@ -17,7 +17,7 @@ Configs in `appsettings.json`; passwords via env vars like `DB_SAMPLESQL_PASSWOR
 1. Clone repo:
    ```
    git clone &lt;repo&gt;
-   cd McpServer
+   cd sql-mcp
    ```
 2. Restore:
    ```
@@ -60,7 +60,7 @@ Configs in `appsettings.json`; passwords via env vars like `DB_SAMPLESQL_PASSWOR
 - `Program.cs`: App setup, endpoint.
 - `Services/QueryService.cs`: Executes queries via DbProviderFactories.
 - `Models/`: DTOs.
-- `McpServer.sln`: Solution.
+- `sql-mcp.sln`: Solution.
 
 See `task.md` for origins.
 

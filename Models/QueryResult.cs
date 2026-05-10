@@ -1,4 +1,4 @@
-namespace McpServer.Models;
+namespace SqlMcp.Models;
 
 public record QueryResult(
     string[] Columns,
