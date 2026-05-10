@@ -1,0 +1,1 @@
+Create a .NET 10 MCP Server app that lets AI agents query SQL Server, Oracle, Postgres, and MySQL databases.

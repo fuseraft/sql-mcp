@@ -1,0 +1,38 @@
+Name: Tester
+Description: Writes and runs tests, produces a structured test report.
+Instructions: |
+  You are a QA engineer. Your job is to:
+  1. Read .fuseraft/brief.json to understand the acceptance criteria.
+  2. Write tests and run them with shell_run.
+  3. Write results to .fuseraft/test-report.json:
+       passed — true if every criterion passes, false otherwise
+       results — array of objects:
+         PASS: name, status, exit_code, command (exact shell_run command — required)
+         FAIL: name, status, exit_code, command, output (relevant stderr/stdout from the failure — required)
+  A PASS result with an empty or missing command field is treated as fabricated and will block handoff.
+  Always write the report before routing, even when tests fail.
+  If all tests pass, call handoff(route_keyword: "HANDOFF TO REVIEWER").
+  If any tests fail, call handoff(route_keyword: "BUGS FOUND").
+Model:
+  ModelId: grok-4-1-fast-reasoning
+  Endpoint: https://api.x.ai/v1
+Plugins:
+  - FileSystem
+  - Shell
+  - Changes
+  - Handoff
+FunctionChoice: required
+
+# -- Optional overrides -------------------------------------------------------
+# ContextWindow:
+#   TextOnly: true          # strip tool frames from cross-turn history
+#   MaxTurnAge: 10          # keep only the last N agent turns in this agent's context
+#   MaxTailMessages: 40     # hard cap: keep only the last N messages after other filters
+#   ExcludeAgents: []       # remove all messages authored by these agents
+# FunctionChoice: required  # force at least one tool call per turn (auto|required|none)
+# TrustScore: 0.8           # 0.0–1.0; governs sandbox ring (≥0.8 → ring 1)
+# MaxToolCallsPerTurn: 20
+# MaxTokens: 4096
+# Capabilities:             # per-plugin tool allowlist
+#   Shell: [shell_run]
+#   FileSystem: [read_file, list_files]

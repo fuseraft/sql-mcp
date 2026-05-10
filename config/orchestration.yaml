@@ -1,0 +1,126 @@
+Orchestration:
+  Name: Graph Pipeline
+  Description: >-
+    Planner → Developer → Tester → Reviewer expressed as a declarative directed graph.
+    Back-edges (BUGS FOUND, REVISION REQUIRED, REPLAN REQUIRED) return to earlier nodes
+    without restarting the full pipeline. APPROVED routes to a terminal confirmation node.
+
+  ChangeTracking:
+    Path: .fuseraft/state/changes.json
+
+  Validation:
+    BriefPath: .fuseraft/brief.json
+    TestReportPath: .fuseraft/test-report.json
+    ChangeLogPath: .fuseraft/state/changes.json
+
+  Events:
+    Path: .fuseraft/logs/events.jsonl
+
+  # Each agent lives in its own YAML file in agents/ — edit, version, or reuse
+  # them independently across configs. Inline fields override the file at load time.
+  Agents:
+    - AgentFile: agents/planner.yaml
+    - AgentFile: agents/developer.yaml
+    - AgentFile: agents/tester.yaml
+    - AgentFile: agents/reviewer.yaml
+    - AgentFile: agents/approved.yaml
+
+  Selection:
+    Type: graph
+    Graph:
+      EntryNode: planner
+      MaxRetries: 4   # max consecutive validator failures per node before HITL escalation
+
+      # Nodes bind agents to named positions in the graph. IDs are stable,
+      # lowercase, and appear in event logs. Multiple nodes may share an agent.
+      Nodes:
+        - Id: planner
+          Agent: Planner
+        - Id: developer
+          Agent: Developer
+        - Id: tester
+          Agent: Tester
+        - Id: reviewer
+          Agent: Reviewer             # routes on keyword — NOT terminal
+        - Id: approved                # terminal node — session ends after this run
+          Agent: Approved
+          Terminal: true
+
+      # Edges define control flow — first matching edge fires each turn.
+      # Forward edges (target has higher BFS layer) use SendMessage within the
+      # current MAF phase. Back-edges (lower layer) yield and restart the phase
+      # loop from the target node, enabling cycles without a DAG violation.
+      Edges:
+        # ── Forward edges ──────────────────────────────────────────────
+        - From: planner
+          To: developer
+          Keyword: "HANDOFF TO DEVELOPER"
+          Validators: [RequireBrief]      # blocks until brief.json is valid
+
+        - From: developer
+          To: tester
+          Keyword: "HANDOFF TO TESTER"
+          Validators: [RequireWriteFile]  # blocks until at least one file is written
+
+        - From: tester
+          To: reviewer
+          Keyword: "HANDOFF TO REVIEWER"
+          Validators: [TestReportValid]   # blocks until test-report.json passes
+
+        - From: reviewer
+          To: approved
+          Keyword: "APPROVED"
+          Validators: [RequireReviewJudgement]  # gate on edge; terminal node runs clean
+
+        # ── Back-edges (cycles) ─────────────────────────────────────────
+        - From: tester
+          To: developer
+          Keyword: "BUGS FOUND"           # test failures → back to developer
+
+        - From: reviewer
+          To: developer
+          Keyword: "REVISION REQUIRED"    # review feedback → back to developer
+
+        - From: developer
+          To: planner
+          Keyword: "REPLAN REQUIRED"      # unclear brief → back to planner
+
+  Termination:
+    Type: composite
+    Strategies:
+      - Type: regex
+        Pattern: "\\bAPPROVED\\b"
+        AgentNames: [Reviewer]
+      - Type: maxiterations
+        MaxIterations: 60
+
+  # ---------------------------------------------------------------------------
+  # OPTIONAL EXTRAS — uncomment as needed
+  # ---------------------------------------------------------------------------
+
+  # EvidenceStore:              # required for evidence contracts
+  #   Path: .fuseraft/state/evidence.json
+
+  # Contracts:
+  #   - Name: BriefExists
+  #     Requires:
+  #       - Type: FileExists
+  #         Path: .fuseraft/brief.json
+
+  # Security:
+  #   FileSystemSandboxPath: ~/my-project
+
+  # Compaction:
+  #   TriggerTurnCount: 30
+  #   KeepRecentTurns: 8
+  #   Mode: lossless
+
+  # Checkpoint:
+  #   Mode: json
+  #   Path: .fuseraft/checkpoints
+
+  # Models:
+  #   fast:
+  #     ModelId: grok-4-1-fast-reasoning
+  #   reasoning:
+  #     ModelId: grok-4-1-fast-reasoning

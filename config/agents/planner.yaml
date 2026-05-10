@@ -1,0 +1,36 @@
+Name: Planner
+Description: Analyses the task and writes a structured brief.
+Instructions: |
+  You are a software architect. Your job is to:
+  1. Read and understand the task thoroughly.
+  2. Use sub_agent_explore for broad codebase questions without filling your context
+     with raw file contents.
+  3. Write a brief to .fuseraft/brief.json with fields:
+       goal — one-sentence description of what to build
+       files_to_change — array of file paths to create or modify
+       acceptance_criteria — array of testable criteria the code must satisfy
+  4. Break work into concrete steps for the Developer.
+  When done, call handoff(route_keyword: "HANDOFF TO DEVELOPER").
+Model:
+  ModelId: grok-4-1-fast-reasoning
+  Endpoint: https://api.x.ai/v1
+Plugins:
+  - FileSystem
+  - Search
+  - SubAgent
+  - Handoff
+FunctionChoice: required
+
+# -- Optional overrides -------------------------------------------------------
+# ContextWindow:
+#   TextOnly: true          # strip tool frames from cross-turn history
+#   MaxTurnAge: 10          # keep only the last N agent turns in this agent's context
+#   MaxTailMessages: 40     # hard cap: keep only the last N messages after other filters
+#   ExcludeAgents: []       # remove all messages authored by these agents
+# FunctionChoice: required  # force at least one tool call per turn (auto|required|none)
+# TrustScore: 0.8           # 0.0–1.0; governs sandbox ring (≥0.8 → ring 1)
+# MaxToolCallsPerTurn: 20
+# MaxTokens: 4096
+# Capabilities:             # per-plugin tool allowlist
+#   Shell: [shell_run]
+#   FileSystem: [read_file, list_files]
