@@ -4,11 +4,11 @@ using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddSingleton&lt;QueryService&gt;(provider =&gt; new QueryService(provider.GetRequiredService&lt;IConfiguration&gt;()));
+builder.Services.AddSingleton<QueryService>(provider => new QueryService(provider.GetRequiredService<IConfiguration>()));
 
 var app = builder.Build();
 
-app.MapPost("/api/query", async (QueryService svc, QueryRequest req) =&gt;
+app.MapPost("/api/query", async (QueryService svc, QueryRequest req) =>
 {
     var result = await svc.ExecuteAsync(req);
     if (result.IsError)
@@ -17,7 +17,7 @@ app.MapPost("/api/query", async (QueryService svc, QueryRequest req) =&gt;
     return Results.Ok(result.Value);
 });
 
-app.MapGet("/tools", () =&gt; Results.Ok(new[]
+app.MapGet("/tools", () => Results.Ok(new[]
 {
     new
     {
@@ -42,7 +42,7 @@ app.MapGet("/tools", () =&gt; Results.Ok(new[]
     }
 }));
 
-app.MapPost("/tools/{toolName}/invoke", async (string toolName, JsonElement input, QueryService svc) =&gt;
+app.MapPost("/tools/{toolName}/invoke", async (string toolName, JsonElement input, QueryService svc) =>
 {
     try
     {
@@ -55,7 +55,9 @@ app.MapPost("/tools/{toolName}/invoke", async (string toolName, JsonElement inpu
         }
         if (toolName == "query_database")
         {
-            var req = JsonSerializer.Deserialize&lt;QueryRequest&gt;(input.GetRawText()!)!;
+            if (!input.TryGetProperty("dbName", out var dbProp) || !input.TryGetProperty("sql", out var sqlProp))
+                return Results.BadRequest("Missing dbName or sql");
+            var req = new QueryRequest(dbProp.GetString()!, sqlProp.GetString()!);
             var result = await svc.ExecuteAsync(req);
             if (result.IsError)
                 return Results.Problem(result.Error);
