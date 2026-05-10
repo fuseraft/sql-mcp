@@ -17,7 +17,7 @@ app.MapPost("/api/query", async (QueryService svc, QueryRequest req) =>
     return Results.Ok(result.Value);
 });
 
-app.MapGet("/tools", () => Results.Ok(new[]
+app.MapGet("/tools", () => Results.Ok(new object[]
 {
     new
     {
@@ -37,7 +37,7 @@ app.MapGet("/tools", () => Results.Ok(new[]
                 dbName = new { type = "string", description = "Database name from list_databases." },
                 sql = new { type = "string", description = "SELECT query." }
             },
-            required = new[] { "dbName", "sql" }
+            required = new object[] { "dbName", "sql" }
         }
     }
 }));
@@ -50,7 +50,7 @@ app.MapPost("/tools/{toolName}/invoke", async (string toolName, JsonElement inpu
         {
             var dbs = svc.ListDatabases();
             var text = JsonSerializer.Serialize(dbs);
-            var resp = new { content = new[] { new { type = "text", text } } };
+            var resp = new { content = new object[] { new { type = "text", text } } };
             return Results.Ok(resp);
         }
         if (toolName == "query_database")
@@ -62,7 +62,7 @@ app.MapPost("/tools/{toolName}/invoke", async (string toolName, JsonElement inpu
             if (result.IsError)
                 return Results.Problem(result.Error);
             var text = JsonSerializer.Serialize(result.Value);
-            var resp = new { content = new[] { new { type = "text", text } } };
+            var resp = new { content = new object[] { new { type = "text", text } } };
             return Results.Ok(resp);
         }
         return Results.NotFound();
