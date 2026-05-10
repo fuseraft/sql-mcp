@@ -60,7 +60,7 @@ Configs in `appsettings.json`; passwords via env vars like `DB_SAMPLESQL_PASSWOR
 - `Program.cs`: App setup, endpoint.
 - `Services/QueryService.cs`: Executes queries via DbProviderFactories.
 - `Models/`: DTOs.
-- `test.sln`: Solution.
+- `McpServer.sln`: Solution.
 
 See `task.md` for origins.
 
