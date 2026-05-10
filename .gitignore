@@ -1,0 +1,54 @@
+# Dependency directories
+bin/
+obj/
+packages/
+**/bin/
+**/obj/
+
+# Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[RR]elease/
+x64/
+x86/
+w32/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+# Visual Studio / Visual Web Developer
+**/*.user
+**/*.userosscache
+**/*.sln.docstates
+
+# Visual Studio Code
+.vscode/
+
+# JetBrains Rider
+.idea/
+
+# Logs
+logs
+*.log
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.lock
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Fuseraft
+.fuseraft/
