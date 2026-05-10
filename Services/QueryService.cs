@@ -64,7 +64,6 @@ public class QueryService
     public record Result<TValue, TError>(TValue? Value, TError? Error)
     {
         public bool IsError => Error is not null;
-        public TValue Value => Value!;
-        public TError Error => Error!;
+
     }
 }
