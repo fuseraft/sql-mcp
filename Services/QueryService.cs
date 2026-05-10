@@ -66,4 +66,6 @@ public class QueryService
         public bool IsError => Error is not null;
 
     }
+
+    public string[] ListDatabases() => _dbs.Select(d => d.Name).ToArray();
 }
