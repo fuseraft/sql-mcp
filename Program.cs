@@ -1,5 +1,6 @@
 using SqlMcp.Models;
 using SqlMcp.Services;
+using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
 
