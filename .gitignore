@@ -52,3 +52,10 @@ Thumbs.db
 
 # Fuseraft
 .fuseraft/
+
+# Publish output
+publish/
+
+# Local dev settings (may contain real credentials)
+appsettings.Development.json
+appsettings.Local.json

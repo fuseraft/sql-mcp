@@ -1,0 +1,6 @@
+bin/
+obj/
+.git/
+.fuseraft/
+*.md
+appsettings.Development.json
