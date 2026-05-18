@@ -1,6 +1,6 @@
 # sql-mcp
 
-A lightweight .NET 10 MCP server that proxies read-only SQL queries to multiple databases. Designed for AI agents in the FuseRaft orchestration framework.
+A lightweight .NET 10 MCP server that proxies read-only SQL queries to multiple databases. Designed for AI agents in the [fuseraft](https://github.com/fuseraft/fuseraft-cli) orchestration framework.
 
 Supported databases: **SQL Server**, **PostgreSQL**, **MySQL**, **Oracle**
 
