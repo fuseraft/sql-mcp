@@ -59,3 +59,10 @@ publish/
 # Local dev settings (may contain real credentials)
 appsettings.Development.json
 appsettings.Local.json
+# .fuseraft/ — user-authored; runtime artifacts live globally in ~/.fuseraft/
+# Stale local runtime dirs from before the global migration — delete once confirmed empty
+.fuseraft/state/
+.fuseraft/logs/
+.fuseraft/sessions/
+.fuseraft/knowledge/repository/
+.fuseraft/memory/
