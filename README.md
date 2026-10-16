@@ -1,6 +1,6 @@
 # sql-mcp
 
-A lightweight .NET 10 MCP server that proxies read-only SQL queries to multiple databases. Designed for AI agents in the [fuseraft](https://github.com/fuseraft/fuseraft-cli) orchestration framework.
+A lightweight .NET 10 [Model Context Protocol](https://modelcontextprotocol.io) server that proxies read-only SQL queries to multiple databases. Designed for AI agents in the [fuseraft](https://github.com/fuseraft/fuseraft-cli) orchestration framework.
 
 Supported databases: **SQL Server**, **PostgreSQL**, **MySQL**, **Oracle**
 
@@ -24,9 +24,53 @@ dotnet restore
 export DB_SAMPLESQL_PASSWORD=yourpassword
 export DB_SAMPLEPG_PASSWORD=yourpassword
 
+# Streamable HTTP transport
 dotnet run
-# Listening on http://*:8080
+# MCP endpoint at http://localhost:8080/mcp
+
+# stdio transport
+dotnet run -- --stdio
 ```
+
+The server speaks MCP over two transports, selected at startup:
+
+| Mode | Start with | Use when |
+|------|-----------|----------|
+| Streamable HTTP | `sql-mcp` | Running as a shared service (Docker, systemd, Windows Service). MCP endpoint is `/mcp`. |
+| stdio | `sql-mcp --stdio` | The MCP client launches the server itself as a subprocess. |
+
+`appsettings.json` is read from the directory containing the executable, not the current working directory, so stdio clients can launch it from anywhere.
+
+### Connecting a client
+
+stdio (e.g. Claude Code, Cline, fuseraft):
+
+```json
+{
+  "mcpServers": {
+    "sql": {
+      "command": "/opt/sql-mcp/sql-mcp",
+      "args": ["--stdio"],
+      "env": { "DB_PROD_PASSWORD": "secret" }
+    }
+  }
+}
+```
+
+Streamable HTTP:
+
+```json
+{
+  "mcpServers": {
+    "sql": {
+      "type": "http",
+      "url": "http://localhost:8080/mcp"
+    }
+  }
+}
+```
+
+With Claude Code: `claude mcp add --transport http sql http://localhost:8080/mcp`, or `claude mcp add sql -- /opt/sql-mcp/sql-mcp --stdio`.
 
 ---
 
@@ -88,50 +132,39 @@ App__MaxRows=500
 
 ## API
 
-### MCP tool endpoints
+### MCP tools
 
-**`GET /tools`** — list available tools
-
-**`POST /tools/{toolName}/invoke`** — invoke a tool
+Both tools are annotated `readOnlyHint: true`. Errors (unknown database, rejected statement, database errors) are returned as tool results with `isError: true`.
 
 #### `list_databases`
 
-Returns the names of all configured databases.
-
-```bash
-curl -X POST http://localhost:8080/tools/list_databases/invoke \
-  -H "Content-Type: application/json" \
-  -d '{}'
-```
-
-```json
-{
-  "content": [{ "type": "text", "text": "[\"prod\",\"reporting\"]" }]
-}
-```
+Returns the names of all configured databases as a JSON array, e.g. `["prod","reporting"]`.
 
 #### `query_database`
 
-Executes a SELECT query. Only `SELECT` and `WITH` (CTE) statements are accepted.
+| Argument | Type | Description |
+|----------|------|-------------|
+| `dbName` | string | Database name from `list_databases`. |
+| `sql` | string | Query to execute. Only `SELECT` and `WITH` (CTE) statements are accepted. |
 
-```bash
-curl -X POST http://localhost:8080/tools/query_database/invoke \
-  -H "Content-Type: application/json" \
-  -d '{"dbName": "prod", "sql": "SELECT id, name FROM users LIMIT 10"}'
-```
+Returns the result as JSON text:
 
 ```json
-{
-  "content": [{
-    "type": "text",
-    "text": "{\"columns\":[\"id\",\"name\"],\"rows\":[...],\"truncated\":false}"
-  }]
-}
+{ "columns": ["id", "name"], "rows": [{ "id": 1, "name": "Ada" }], "truncated": false }
+```
+
+Example over Streamable HTTP (the server runs stateless, so no `initialize` handshake is needed for a one-off call):
+
+```bash
+curl -s http://localhost:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query_database","arguments":{"dbName":"prod","sql":"SELECT 1 AS test"}}}'
 ```
 
 ### Direct query endpoint
 
-**`POST /api/query`** — same as `query_database` but returns the result directly without MCP envelope.
+**`POST /api/query`** (HTTP mode only) — plain REST equivalent of `query_database`, for non-MCP callers.
 
 ```json
 { "dbName": "prod", "sql": "SELECT 1 AS test" }
@@ -139,7 +172,7 @@ curl -X POST http://localhost:8080/tools/query_database/invoke \
 
 ### Health check
 
-**`GET /health`** — returns `200 {"status":"healthy"}`. Suitable for load balancer and orchestrator probes.
+**`GET /health`** (HTTP mode only) — returns `200 {"status":"healthy"}`. Suitable for load balancer and orchestrator probes.
 
 ---
 
@@ -217,7 +250,8 @@ Set passwords via system environment variables or an `appsettings.Production.jso
 
 ```
 sql-mcp/
-├── Program.cs                        # App wiring, endpoints
+├── Program.cs                        # Transport selection (stdio / HTTP), endpoints
+├── Tools/SqlTools.cs                 # MCP tool definitions
 ├── Services/QueryService.cs          # Query execution, validation, row limiting
 ├── Models/
 │   ├── DbConfig.cs                   # Database config model

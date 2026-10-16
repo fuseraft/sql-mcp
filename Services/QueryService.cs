@@ -17,7 +17,7 @@ public class QueryService
         _queryTimeoutSeconds = config.GetValue("App:QueryTimeoutSeconds", 30);
     }
 
-    public async Task<Result<QueryResult, string>> ExecuteAsync(QueryRequest req)
+    public async Task<Result<QueryResult, string>> ExecuteAsync(QueryRequest req, CancellationToken ct = default)
     {
         if (!IsReadOnlyQuery(req.Sql))
             return new(null!, "Only SELECT queries (including CTEs) are permitted.");
@@ -33,14 +33,14 @@ public class QueryService
             var factory = DbProviderFactories.GetFactory(db.GetInvariantName());
             await using var conn = factory.CreateConnection()!;
             conn.ConnectionString = connStr;
-            await conn.OpenAsync();
+            await conn.OpenAsync(ct);
 
             await using var cmd = factory.CreateCommand()!;
             cmd.CommandText = req.Sql;
             cmd.Connection = conn;
             cmd.CommandTimeout = _queryTimeoutSeconds;
 
-            await using var reader = await cmd.ExecuteReaderAsync();
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
 
             var schemaTable = reader.GetSchemaTable()!;
             var columns = schemaTable.Rows.Cast<DataRow>()
@@ -48,7 +48,7 @@ public class QueryService
                 .ToArray();
 
             var rows = new List<Dictionary<string, object?>>();
-            while (await reader.ReadAsync())
+            while (await reader.ReadAsync(ct))
             {
                 if (rows.Count >= _maxRows)
                     break;
@@ -60,6 +60,10 @@ public class QueryService
             }
 
             return new(new QueryResult(columns, [.. rows], rows.Count >= _maxRows), null!);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {

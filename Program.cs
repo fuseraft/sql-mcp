@@ -1,6 +1,5 @@
 using SqlMcp.Models;
 using SqlMcp.Services;
-using System.Text.Json;
 using System.Data.Common;
 using Microsoft.Data.SqlClient;
 using Oracle.ManagedDataAccess.Client;
@@ -12,83 +11,58 @@ DbProviderFactories.RegisterFactory("Oracle.ManagedDataAccess.Client", OracleCli
 DbProviderFactories.RegisterFactory("Npgsql", NpgsqlFactory.Instance);
 DbProviderFactories.RegisterFactory("MySqlConnector", MySqlConnectorFactory.Instance);
 
-var builder = WebApplication.CreateBuilder(args);
+// MCP clients launch stdio servers from their own working directory, so resolve
+// appsettings.json next to the executable rather than relative to the cwd.
+var contentRoot = AppContext.BaseDirectory;
 
-builder.Host.UseWindowsService(o => o.ServiceName = "sql-mcp");
-builder.Host.UseSystemd();
-
-builder.Services.AddSingleton<QueryService>();
-
-var app = builder.Build();
-
-app.MapGet("/health", () => Results.Ok(new { status = "healthy" }));
-
-app.MapGet("/tools", () => Results.Ok(new object[]
+if (args.Contains("--stdio"))
 {
-    new
+    var builder = Host.CreateApplicationBuilder(new HostApplicationBuilderSettings
     {
-        name = "list_databases",
-        description = "List available database names configured in appsettings.json.",
-        inputSchema = new { type = "object", properties = new { }, required = new string[0] }
-    },
-    new
-    {
-        name = "query_database",
-        description = "Execute a read-only SELECT query on the specified database and return results as JSON.",
-        inputSchema = new
-        {
-            type = "object",
-            properties = new
-            {
-                dbName = new { type = "string", description = "Database name from list_databases." },
-                sql = new { type = "string", description = "SELECT query to execute." }
-            },
-            required = new object[] { "dbName", "sql" }
-        }
-    }
-}));
+        Args = args,
+        ContentRootPath = contentRoot
+    });
 
-app.MapPost("/tools/{toolName}/invoke", async (string toolName, JsonElement input, QueryService svc, ILogger<Program> logger) =>
+    // stdout carries the JSON-RPC stream; all logging must go to stderr.
+    builder.Logging.AddConsole(o => o.LogToStandardErrorThreshold = LogLevel.Trace);
+
+    builder.Services.AddSingleton<QueryService>();
+    builder.Services.AddMcpServer()
+        .WithStdioServerTransport()
+        .WithToolsFromAssembly();
+
+    await builder.Build().RunAsync();
+}
+else
 {
-    try
+    var builder = WebApplication.CreateBuilder(new WebApplicationOptions
     {
-        if (toolName == "list_databases")
-        {
-            var dbs = svc.ListDatabases();
-            var text = JsonSerializer.Serialize(dbs);
-            return Results.Ok(new { content = new object[] { new { type = "text", text } } });
-        }
+        Args = args,
+        ContentRootPath = contentRoot
+    });
 
-        if (toolName == "query_database")
-        {
-            if (!input.TryGetProperty("dbName", out var dbProp) || !input.TryGetProperty("sql", out var sqlProp))
-                return Results.BadRequest("Missing required fields: dbName, sql");
+    builder.Host.UseWindowsService(o => o.ServiceName = "sql-mcp");
+    builder.Host.UseSystemd();
 
-            var req = new QueryRequest(dbProp.GetString()!, sqlProp.GetString()!);
-            var result = await svc.ExecuteAsync(req);
-            if (result.IsError)
-                return Results.Problem(result.Error);
+    builder.Services.AddSingleton<QueryService>();
+    builder.Services.AddMcpServer()
+        .WithHttpTransport(o => o.Stateless = true)
+        .WithToolsFromAssembly();
 
-            var text = JsonSerializer.Serialize(result.Value);
-            return Results.Ok(new { content = new object[] { new { type = "text", text } } });
-        }
+    var app = builder.Build();
 
-        return Results.NotFound($"Unknown tool: {toolName}");
-    }
-    catch (Exception ex)
+    app.MapMcp("/mcp");
+
+    app.MapGet("/health", () => Results.Ok(new { status = "healthy" }));
+
+    app.MapPost("/api/query", async (QueryService svc, QueryRequest req, CancellationToken ct) =>
     {
-        logger.LogError(ex, "Unhandled error invoking tool {ToolName}", toolName);
-        return Results.Problem("An unexpected error occurred.");
-    }
-});
+        var result = await svc.ExecuteAsync(req, ct);
+        if (result.IsError)
+            return Results.Problem(result.Error);
+        return Results.Ok(result.Value);
+    });
 
-app.MapPost("/api/query", async (QueryService svc, QueryRequest req) =>
-{
-    var result = await svc.ExecuteAsync(req);
-    if (result.IsError)
-        return Results.Problem(result.Error);
-    return Results.Ok(result.Value);
-});
-
-var urls = app.Configuration["App:Urls"] ?? "http://*:8080";
-app.Run(urls);
+    var urls = app.Configuration["App:Urls"] ?? "http://*:8080";
+    await app.RunAsync(urls);
+}
