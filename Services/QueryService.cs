@@ -49,10 +49,16 @@ public class QueryService
         if (!verdict.IsAllowed)
             return new(null!, verdict.Error!);
 
+        var (parameters, parameterError) = QueryParameters.Parse(req.Parameters);
+        if (parameterError is not null)
+            return new(null!, parameterError);
+
         return await RunAsync(db, async newCommand =>
         {
             await using var cmd = newCommand();
             cmd.CommandText = verdict.Sql;
+            foreach (var (name, value) in parameters)
+                QueryParameters.Add(cmd, db.Provider, name, value);
             return await ReadResultAsync(cmd, ct);
         }, ct);
     }

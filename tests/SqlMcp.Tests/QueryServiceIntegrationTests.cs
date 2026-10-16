@@ -2,6 +2,7 @@ using Microsoft.Extensions.Configuration;
 using SqlMcp.Models;
 using SqlMcp.Services;
 using System.Data.Common;
+using System.Text.Json;
 
 namespace SqlMcp.Tests;
 
@@ -564,5 +565,116 @@ public class QueryServiceIntegrationTests
 
         Assert.Contains("is disabled", (await svc.ListTablesAsync("test", null)).Error);
         Assert.Contains("is disabled", (await svc.DescribeTableAsync("test", Table, null)).Error);
+    }
+
+    private static string P(DbProvider provider, string name) => (provider == DbProvider.Oracle ? ":" : "@") + name;
+
+    private static Dictionary<string, JsonElement> Params(string json) =>
+        JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(json)!;
+
+    private static QueryRequest Query(string sql, string parameters) => new("test", sql, Params(parameters));
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Binds_a_value_that_contains_quotes(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+        await SeedAsync(db, $"INSERT INTO {Table} (id, name) VALUES (4, 'O''Brien')");
+
+        var result = await Service(db).ExecuteAsync(Query(
+            $"SELECT id FROM {Table} WHERE name = {P(provider, "name")}", """{"name": "O'Brien"}"""));
+
+        Assert.True(result.Error is null, result.Error);
+        Assert.Equal(4, Convert.ToInt32(Assert.Single(result.Value!.Rows).Values.Single()));
+    }
+
+    // Written into the SQL, each of these would change the query. Bound, they are just
+    // strings that no row's name equals.
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Bound_values_cannot_change_the_query(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+        await SeedAsync(db);
+        var svc = Service(db);
+
+        foreach (var attack in new[] { "x' OR '1'='1", "'; DELETE FROM sqlmcp_fixture; --", "x' UNION SELECT 99 FROM sqlmcp_fixture --", "\\'; DROP TABLE sqlmcp_fixture; --" })
+        {
+            var result = await svc.ExecuteAsync(new("test", $"SELECT id FROM {Table} WHERE name = {P(provider, "name")}",
+                new() { ["name"] = JsonSerializer.SerializeToElement(attack) }));
+
+            Assert.True(result.Error is null, $"{attack}: {result.Error}");
+            Assert.Empty(result.Value!.Rows);
+        }
+        Assert.Equal(3, await CountAsync(db));
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Binds_numbers_and_null(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+        await SeedAsync(db);
+        var svc = Service(db);
+        var sql = $"SELECT id FROM {Table} WHERE id >= {P(provider, "min")} ORDER BY id";
+
+        Assert.Equal(2, (await svc.ExecuteAsync(Query(sql, """{"min": 2}"""))).Value!.Rows.Length);
+        Assert.Single((await svc.ExecuteAsync(Query(sql, """{"min": 2.5}"""))).Value!.Rows);
+
+        var none = await svc.ExecuteAsync(Query($"SELECT id FROM {Table} WHERE name = {P(provider, "name")}", """{"name": null}"""));
+        Assert.True(none.Error is null, none.Error);
+        Assert.Empty(none.Value!.Rows);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Binds_several_parameters_including_one_used_twice(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+        await SeedAsync(db);
+
+        var result = await Service(db).ExecuteAsync(Query(
+            $"SELECT id FROM {Table} WHERE (id = {P(provider, "a")} OR id = {P(provider, "b")}) AND id <> {P(provider, "a")} + 10 ORDER BY id",
+            """{"a": 1, "b": 3}"""));
+
+        Assert.True(result.Error is null, result.Error);
+        Assert.Equal([1, 3], result.Value!.Rows.Select(r => Convert.ToInt32(r.Values.Single())));
+    }
+
+    // Postgres won't compare text with a date; strings are sent untyped so it infers the type.
+    [SkippableFact]
+    public async Task Postgres_infers_the_type_of_a_string_value()
+    {
+        var db = RequireDb(DbProvider.Postgres);
+
+        var result = await Service(db).ExecuteAsync(Query(
+            "SELECT 1 AS one WHERE DATE '2024-01-02' > @d AND 5 > @n", """{"d": "2024-01-01", "n": "4"}"""));
+
+        Assert.True(result.Error is null, result.Error);
+        Assert.Single(result.Value!.Rows);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Reports_a_missing_parameter(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+        await SeedAsync(db);
+
+        var result = await Service(db).ExecuteAsync(Query(
+            $"SELECT id FROM {Table} WHERE id = {P(provider, "missing")}", """{"other": 1}"""));
+
+        Assert.NotNull(result.Error);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Rejects_bad_parameters_before_connecting(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+
+        var result = await Service(db).ExecuteAsync(Query($"SELECT 1 AS one{From(provider)}", """{"a b": 1}"""));
+
+        Assert.Contains("invalid", result.Error);
     }
 }

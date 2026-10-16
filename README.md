@@ -184,6 +184,20 @@ A table the login can't read is reported as not found.
 |----------|------|-------------|
 | `dbName` | string | Database name from `list_databases`. |
 | `sql` | string | A single `SELECT` or `WITH` query. See [Security](#security). |
+| `parameters` | object, optional | Values for placeholders in `sql`, by name. Values may be strings, numbers, booleans or `null`. |
+
+Put values in `parameters` instead of writing them into the SQL. They are sent to the database separately from the query text, so a value like `O'Brien` needs no escaping and a value like `x' OR '1'='1` is only ever compared as a string. Placeholders use each database's own syntax:
+
+| Provider | Placeholder |
+|----------|-------------|
+| SQL Server, Postgres, MySQL | `@name` |
+| Oracle | `:name` |
+
+```json
+{ "dbName": "prod", "sql": "SELECT id, total FROM orders WHERE customer = @customer AND total >= @min", "parameters": { "customer": "O'Brien", "min": 100 } }
+```
+
+Names are letters, digits and underscores (a leading `@` or `:` in the key is ignored), up to 100 per query. A placeholder can be used more than once. Whole numbers are bound as 64-bit integers, other numbers as decimals. On Postgres, strings are sent untyped so the server infers the type from where the placeholder is used, as it does for a quoted literal: `WHERE created_at > @since` with `"2024-01-01"` compares dates. Where Postgres can't infer a type (`@x IS NULL`), cast the placeholder: `CAST(@x AS text) IS NULL`.
 
 Returns the result as JSON text:
 
@@ -205,7 +219,7 @@ curl -s http://localhost:8080/mcp \
 **`POST /api/query`** (HTTP mode only) — plain REST equivalent of `query_database`, for non-MCP callers.
 
 ```json
-{ "dbName": "prod", "sql": "SELECT 1 AS test" }
+{ "dbName": "prod", "sql": "SELECT name FROM users WHERE id = @id", "parameters": { "id": 7 } }
 ```
 
 ### Health check
@@ -249,6 +263,8 @@ Queries come from AI agents, so every query passes three layers before anything 
 **What agents can still do:** read anything the login can read. Grant `SELECT` only on what agents should see. Two cases fall outside the audit: grants made after a passing audit (noticed within five minutes), and on SQL Server, CLR functions created with `EXTERNAL_ACCESS` or `UNSAFE` that the login can call.
 
 **HTTP transport.** By default the server listens on `localhost` only. To listen beyond it, set `App:AuthToken`: clients then send `Authorization: Bearer <token>` on `/mcp` and `/api/*` (`/health` stays open for probes). The server refuses to start on a non-loopback address without a token unless `App:AllowUnauthenticated` is `true`. Requests that carry an `Origin` header not listed in `App:AllowedOrigins` are rejected, so a web page can't reach a local server through DNS rebinding. The stdio transport is only reachable by the process that launched it.
+
+**Values in queries.** Agents should pass values through `parameters` (see [`query_database`](#query_database)) rather than splicing them into the SQL. Bound values can't change a query's structure, whatever quotes or keywords they contain. Statement validation still applies to the SQL text itself, and catches injected statements in SQL an agent built by concatenating strings.
 
 **Credentials.** Connection strings can be committed safely: put `{password}` where the password goes and name the environment variable to fill it from with `PasswordEnvVar`.
 
@@ -327,6 +343,7 @@ sql-mcp/
 ├── Program.cs                        # Transport selection (stdio / HTTP), endpoints
 ├── Tools/SqlTools.cs                 # MCP tool definitions
 ├── Services/QueryService.cs          # Query execution, read-only transaction, row limiting
+├── Services/QueryParameters.cs       # Bind-parameter parsing and binding
 ├── Services/SchemaCatalog.cs         # Per-provider catalog queries for list_tables / describe_table
 ├── Services/SqlGuard.cs              # Provider-aware statement validation
 ├── Services/LoginAudit.cs            # Per-provider check that the login can only read
