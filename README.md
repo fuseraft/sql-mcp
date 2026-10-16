@@ -141,11 +141,42 @@ App__MaxRows=500
 
 ### MCP tools
 
-Both tools are annotated `readOnlyHint: true`. Errors (unknown database, rejected statement, database errors) are returned as tool results with `isError: true`.
+All tools are annotated `readOnlyHint: true`. Every call that touches a database goes through the same login audit and read-only transaction (see [Security](#security)). Errors (unknown database, unknown table, rejected statement, database errors) are returned as tool results with `isError: true`.
 
 #### `list_databases`
 
 Returns the names of all configured databases as a JSON array, e.g. `["prod","reporting"]`.
+
+#### `list_tables`
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `dbName` | string | Database name from `list_databases`. |
+| `schema` | string, optional | Only list this schema (on MySQL, this is a database name). Matched case-insensitively. |
+
+Returns the tables and views the login can read, sorted by schema and name. System schemas (`pg_catalog`, `information_schema`, MySQL's `mysql` and `sys`, Oracle-maintained schemas such as `SYS`) are left out unless you name one with `schema`. On SQL Server only the database in the connection string is listed. At most `App:MaxRows` entries are returned:
+
+```json
+{ "tables": [{ "schema": "sales", "name": "orders", "type": "table" }, { "schema": "sales", "name": "open_orders", "type": "view" }], "truncated": false }
+```
+
+#### `describe_table`
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `dbName` | string | Database name from `list_databases`. |
+| `table` | string | Table or view name, matched case-insensitively. `schema.table` is accepted. |
+| `schema` | string, optional | Needed only when the name exists in more than one schema. Without it, every non-system schema is searched. |
+
+Returns the columns in order, with the type as the database spells it (`character varying(20)`, `nvarchar(max)`, `NUMBER(10,2)`):
+
+```json
+{ "schema": "sales", "name": "orders", "type": "table", "columns": [
+  { "name": "id", "dataType": "integer", "nullable": false, "primaryKey": true },
+  { "name": "customer", "dataType": "character varying(100)", "nullable": true, "primaryKey": false } ] }
+```
+
+A table the login can't read is reported as not found.
 
 #### `query_database`
 
@@ -296,13 +327,15 @@ sql-mcp/
 ├── Program.cs                        # Transport selection (stdio / HTTP), endpoints
 ├── Tools/SqlTools.cs                 # MCP tool definitions
 ├── Services/QueryService.cs          # Query execution, read-only transaction, row limiting
+├── Services/SchemaCatalog.cs         # Per-provider catalog queries for list_tables / describe_table
 ├── Services/SqlGuard.cs              # Provider-aware statement validation
 ├── Services/LoginAudit.cs            # Per-provider check that the login can only read
 ├── Http/HttpSecurity.cs              # Bearer token, Origin check, safe binding
 ├── Models/
 │   ├── DbConfig.cs                   # Database config model
 │   ├── QueryRequest.cs               # Request DTO
-│   └── QueryResult.cs                # Response DTO
+│   ├── QueryResult.cs                # Response DTO
+│   └── SchemaInfo.cs                 # list_tables / describe_table results
 ├── Properties/PublishProfiles/
 │   ├── linux-x64.pubxml
 │   └── win-x64.pubxml
@@ -320,7 +353,7 @@ sql-mcp/
 dotnet test
 ```
 
-The validator and HTTP tests always run. The integration tests run against each database whose connection string is set, and are skipped otherwise. Use an administrator login: the tests create their own table, functions, and a read-only `sqlmcp_ro` login to test the audit against.
+The validator and HTTP tests always run. The integration tests run against each database whose connection string is set, and are skipped otherwise. Use an administrator login: the tests create their own tables, a view, functions, and a read-only `sqlmcp_ro` login to test the audit against.
 
 ```bash
 export SQLMCP_TEST_POSTGRES='Host=localhost;Username=postgres;Password=pw'

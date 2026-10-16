@@ -391,4 +391,178 @@ public class QueryServiceIntegrationTests
                 await TryExecAsync(admin, sql);
         }
     }
+
+    private const string KeyedTable = "sqlmcp_keyed";
+    private const string View = "sqlmcp_fixture_v";
+
+    /// <summary>
+    /// Creates (once) a table with a primary key and a view for the schema tools, and
+    /// returns the schema they are in.
+    /// </summary>
+    private static async Task<string> SeedSchemaAsync(DbConfig db)
+    {
+        await SeedAsync(db);
+        await using var conn = await OpenAsync(db);
+        await TryExecAsync(conn, $"CREATE TABLE {KeyedTable} (id INT NOT NULL PRIMARY KEY, label VARCHAR(30))");
+        await TryExecAsync(conn, $"CREATE VIEW {View} AS SELECT id FROM {Table}");
+
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = db.Provider switch
+        {
+            DbProvider.Postgres => "SELECT current_schema()",
+            DbProvider.MySql => "SELECT DATABASE()",
+            DbProvider.SqlServer => "SELECT SCHEMA_NAME()",
+            DbProvider.Oracle => "SELECT USER FROM dual",
+            _ => throw new ArgumentOutOfRangeException(nameof(db))
+        };
+        return Convert.ToString(await cmd.ExecuteScalarAsync())!;
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Lists_tables_and_views(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+        var schema = await SeedSchemaAsync(db);
+
+        var result = await Service(db).ListTablesAsync("test", schema);
+
+        Assert.Null(result.Error);
+        var tables = result.Value!.Tables;
+        Assert.All(tables, t => Assert.Equal(schema, t.Schema));
+        Assert.Contains(tables, t => t.Name.Equals(KeyedTable, StringComparison.OrdinalIgnoreCase) && t.Type == "table");
+        Assert.Contains(tables, t => t.Name.Equals(View, StringComparison.OrdinalIgnoreCase) && t.Type == "view");
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Describes_columns_and_primary_key(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+        var schema = await SeedSchemaAsync(db);
+
+        var result = await Service(db).DescribeTableAsync("test", KeyedTable, schema);
+
+        Assert.Null(result.Error);
+        var table = result.Value!;
+        Assert.Equal(schema, table.Schema);
+        Assert.Equal("table", table.Type);
+        Assert.Equal(["id", "label"], table.Columns.Select(c => c.Name.ToLowerInvariant()));
+
+        var id = table.Columns[0];
+        Assert.False(id.Nullable);
+        Assert.True(id.PrimaryKey);
+        Assert.Contains("int", id.DataType, StringComparison.OrdinalIgnoreCase);
+
+        var label = table.Columns[1];
+        Assert.True(label.Nullable);
+        Assert.False(label.PrimaryKey);
+        Assert.Contains("30", label.DataType);
+    }
+
+    // Oracle's test login is SYSTEM, an Oracle-maintained schema that's hidden unless named.
+    [SkippableTheory]
+    [InlineData(DbProvider.Postgres)]
+    [InlineData(DbProvider.MySql)]
+    [InlineData(DbProvider.SqlServer)]
+    public async Task Finds_a_table_without_a_schema_in_any_case(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+        var schema = await SeedSchemaAsync(db);
+        var svc = Service(db);
+
+        foreach (var name in new[] { KeyedTable, KeyedTable.ToUpperInvariant(), $"{schema}.{KeyedTable}" })
+        {
+            var result = await svc.DescribeTableAsync("test", name, null);
+            Assert.True(result.Error is null, $"{name}: {result.Error}");
+            Assert.Equal(schema, result.Value!.Schema);
+        }
+
+        var all = await svc.ListTablesAsync("test", null);
+        Assert.Contains(all.Value!.Tables, t => t.Schema == schema && t.Name == KeyedTable);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Hides_system_schemas_unless_named(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+        var system = provider switch
+        {
+            DbProvider.Postgres => "pg_catalog",
+            DbProvider.MySql => "mysql",
+            DbProvider.SqlServer => "sys",
+            _ => "SYS"
+        };
+
+        var all = await Service(db, maxRows: 100_000).ListTablesAsync("test", null);
+        Assert.Null(all.Error);
+        Assert.DoesNotContain(all.Value!.Tables, t => t.Schema.Equals(system, StringComparison.OrdinalIgnoreCase));
+
+        // SQL Server's sys catalog views aren't in sys.objects, so there's nothing to name.
+        if (provider != DbProvider.SqlServer)
+        {
+            var named = await Service(db).ListTablesAsync("test", system);
+            Assert.NotEmpty(named.Value!.Tables);
+        }
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Truncates_the_table_list(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+        var schema = await SeedSchemaAsync(db);
+
+        var result = await Service(db, maxRows: 1).ListTablesAsync("test", schema);
+
+        Assert.Single(result.Value!.Tables);
+        Assert.True(result.Value.Truncated);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Reports_a_missing_table(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+
+        var result = await Service(db).DescribeTableAsync("test", "sqlmcp_no_such_table", null);
+
+        Assert.NotNull(result.Error);
+        Assert.Contains("list_tables", result.Error);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Read_only_login_sees_only_what_it_can_read(DbProvider provider)
+    {
+        var admin = RequireDb(provider);
+        var schema = await SeedSchemaAsync(admin);
+        var (readOnly, _) = await ReadOnlyLoginAsync(admin);
+        var svc = Service(readOnly, allowWritableLogin: false);
+
+        var list = await svc.ListTablesAsync("test", schema);
+        Assert.True(list.Error is null, list.Error);
+        var names = list.Value!.Tables.Select(t => t.Name.ToLowerInvariant()).ToList();
+        Assert.Contains(Table, names);
+        Assert.DoesNotContain(KeyedTable, names);
+
+        var described = await svc.DescribeTableAsync("test", Table, schema);
+        Assert.True(described.Error is null, described.Error);
+        Assert.Equal(2, described.Value!.Columns.Length);
+
+        var hidden = await svc.DescribeTableAsync("test", KeyedTable, schema);
+        Assert.Contains("list_tables", hidden.Error);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Schema_tools_refuse_a_login_that_can_write(DbProvider provider)
+    {
+        var admin = RequireDb(provider);
+        var svc = Service(admin, allowWritableLogin: false);
+
+        Assert.Contains("is disabled", (await svc.ListTablesAsync("test", null)).Error);
+        Assert.Contains("is disabled", (await svc.DescribeTableAsync("test", Table, null)).Error);
+    }
 }
