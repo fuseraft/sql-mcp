@@ -1,3 +1,9 @@
+using Microsoft.Data.SqlClient;
+using MySqlConnector;
+using Npgsql;
+using Oracle.ManagedDataAccess.Client;
+using System.Data.Common;
+
 namespace SqlMcp.Models;
 
 public enum DbProvider
@@ -14,12 +20,12 @@ public record DbConfig(
     string ConnectionString,
     string? PasswordEnvVar = null)
 {
-    public string GetInvariantName() => Provider switch
+    public DbProviderFactory GetFactory() => Provider switch
     {
-        DbProvider.SqlServer => "Microsoft.Data.SqlClient",
-        DbProvider.Oracle => "Oracle.ManagedDataAccess.Client",
-        DbProvider.Postgres => "Npgsql",
-        DbProvider.MySql => "MySqlConnector",
+        DbProvider.SqlServer => SqlClientFactory.Instance,
+        DbProvider.Oracle => OracleClientFactory.Instance,
+        DbProvider.Postgres => NpgsqlFactory.Instance,
+        DbProvider.MySql => MySqlConnectorFactory.Instance,
         _ => throw new ArgumentException("Unknown provider")
     };
 }

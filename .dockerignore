@@ -4,3 +4,4 @@ obj/
 .fuseraft/
 *.md
 appsettings.Development.json
+tests/
