@@ -1,21 +1,39 @@
+using Microsoft.Extensions.Logging.Abstractions;
+using MySqlConnector;
+using Oracle.ManagedDataAccess.Client;
 using SqlMcp.Models;
+using System.Collections.Concurrent;
 using System.Data;
 using System.Data.Common;
-using MySqlConnector;
 
 namespace SqlMcp.Services;
 
 public class QueryService
 {
+    // How long a login audit result is trusted before the login is checked again, so a
+    // later GRANT is noticed without a restart.
+    private static readonly TimeSpan AuditLifetime = TimeSpan.FromMinutes(5);
+
+    // ORA-01466: a read-only transaction started too soon after the table's last DDL.
+    private const int OracleTableDefinitionChanged = 1466;
+    private static readonly TimeSpan[] OracleRetryDelays =
+        [TimeSpan.FromMilliseconds(500), TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2)];
+
     private readonly List<DbConfig> _dbs;
     private readonly int _maxRows;
     private readonly int _queryTimeoutSeconds;
+    private readonly ILogger<QueryService> _logger;
+    private readonly ConcurrentDictionary<string, (DateTime CheckedAt, IReadOnlyList<string> Findings)> _audits = new();
 
-    public QueryService(IConfiguration config)
+    public QueryService(IConfiguration config, ILogger<QueryService>? logger = null)
     {
         _dbs = config.GetSection("Databases").Get<List<DbConfig>>() ?? [];
         _maxRows = config.GetValue("App:MaxRows", 1000);
         _queryTimeoutSeconds = config.GetValue("App:QueryTimeoutSeconds", 30);
+        _logger = logger ?? NullLogger<QueryService>.Instance;
+
+        foreach (var db in _dbs.Where(d => d.AllowWritableLogin))
+            _logger.LogWarning("Database {Database} has AllowWritableLogin set; its login is not checked for write access.", db.Name);
     }
 
     public async Task<Result<QueryResult, string>> ExecuteAsync(QueryRequest req, CancellationToken ct = default)
@@ -31,39 +49,73 @@ public class QueryService
         if (!verdict.IsAllowed)
             return new(null!, verdict.Error!);
 
-        var connStr = ResolveConnectionString(db);
-
-        try
+        for (int attempt = 0; ; attempt++)
         {
-            var factory = db.GetFactory();
-            await using var conn = factory.CreateConnection()!;
-            conn.ConnectionString = connStr;
-            await conn.OpenAsync(ct);
-
-            await using var tx = await BeginReadOnlyTransactionAsync(conn, db.Provider, ct);
             try
             {
-                await using var cmd = conn.CreateCommand();
-                cmd.CommandText = verdict.Sql;
-                cmd.Transaction = tx;
-                cmd.CommandTimeout = _queryTimeoutSeconds;
-
-                return new(await ReadResultAsync(cmd, ct), null!);
+                return await ExecuteOnceAsync(db, verdict.Sql, ct);
             }
-            finally
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
-                // Nothing a query does is ever committed.
-                await RollbackQuietlyAsync(tx);
+                throw;
+            }
+            catch (OracleException ex) when (ex.Number == OracleTableDefinitionChanged && attempt < OracleRetryDelays.Length)
+            {
+                await Task.Delay(OracleRetryDelays[attempt], ct);
+            }
+            catch (Exception ex)
+            {
+                return new(null!, $"Query error: {ex.Message}");
             }
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+    }
+
+    private async Task<Result<QueryResult, string>> ExecuteOnceAsync(DbConfig db, string sql, CancellationToken ct)
+    {
+        await using var conn = db.GetFactory().CreateConnection()!;
+        conn.ConnectionString = ResolveConnectionString(db);
+        await conn.OpenAsync(ct);
+
+        if (!await IsLoginReadOnlyAsync(db, conn, ct))
+            return new(null!, $"Database '{db.Name}' is disabled because its login can modify data. The server log lists why.");
+
+        await using var tx = await BeginReadOnlyTransactionAsync(conn, db.Provider, ct);
+        try
         {
-            throw;
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = sql;
+            cmd.Transaction = tx;
+            cmd.CommandTimeout = _queryTimeoutSeconds;
+
+            return new(await ReadResultAsync(cmd, ct), null!);
         }
-        catch (Exception ex)
+        finally
         {
-            return new(null!, $"Query error: {ex.Message}");
+            // Nothing a query does is ever committed.
+            await RollbackQuietlyAsync(tx);
         }
+    }
+
+    private async Task<bool> IsLoginReadOnlyAsync(DbConfig db, DbConnection conn, CancellationToken ct)
+    {
+        if (db.AllowWritableLogin)
+            return true;
+
+        if (!_audits.TryGetValue(db.Name, out var audit) || DateTime.UtcNow - audit.CheckedAt > AuditLifetime)
+        {
+            var findings = await LoginAudit.FindWriteAccessAsync(conn, db.Provider, ct);
+            if (findings.Count > 0)
+            {
+                _logger.LogError(
+                    "Refusing queries on database {Database}: its login is not read-only. It {Findings}. " +
+                    "Use a login that can only read, or set AllowWritableLogin to true for this database to accept the risk.",
+                    db.Name, string.Join("; it ", findings));
+            }
+            audit = (DateTime.UtcNow, findings);
+            _audits[db.Name] = audit;
+        }
+
+        return audit.Findings.Count == 0;
     }
 
     public string[] ListDatabases() => [.. _dbs.Select(d => d.Name)];

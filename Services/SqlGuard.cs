@@ -1,5 +1,4 @@
 using SqlMcp.Models;
-using System.Text;
 
 namespace SqlMcp.Services;
 
@@ -8,9 +7,9 @@ namespace SqlMcp.Services;
 /// identifiers using each provider's own rules, then requires a single SELECT/WITH
 /// statement containing no data-modifying keywords.
 ///
-/// This is the first of two layers: QueryService also runs every query inside a
-/// read-only transaction (where the provider supports one) that is always rolled back.
-/// A least-privileged database user remains the primary control.
+/// This is the first of three layers: QueryService also runs every query inside a
+/// read-only transaction (where the provider supports one) that is always rolled back,
+/// and LoginAudit refuses databases whose login could write.
 /// </summary>
 public static class SqlGuard
 {
@@ -30,6 +29,29 @@ public static class SqlGuard
         "BULK", "WRITETEXT", "UPDATETEXT",
         "WAITFOR", "SHUTDOWN", "KILL", "DBCC", "BACKUP", "RESTORE", "RECONFIGURE",
         "OPENROWSET", "OPENQUERY", "OPENDATASOURCE"
+    };
+
+    // Functions a SELECT can call that advance sequences (not undone by rollback),
+    // reach outside the database, read server files, or run SQL held in a string,
+    // which this check can't see into. Also matched inside quoted identifiers,
+    // since "dblink_exec"(...) is a valid call.
+    private static readonly HashSet<string> DeniedFunctions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        // Sequences: Oracle seq.NEXTVAL, Postgres nextval()/setval()
+        "NEXTVAL", "SETVAL",
+        // Postgres
+        "DBLINK", "DBLINK_EXEC", "DBLINK_CONNECT", "DBLINK_CONNECT_U", "DBLINK_SEND_QUERY",
+        "LO_IMPORT", "LO_EXPORT", "PG_READ_FILE", "PG_READ_BINARY_FILE", "PG_LS_DIR", "PG_STAT_FILE",
+        "PG_TERMINATE_BACKEND", "PG_CANCEL_BACKEND", "PG_RELOAD_CONF", "PG_ROTATE_LOGFILE",
+        "PG_LOGICAL_EMIT_MESSAGE", "PG_NOTIFY", "QUERY_TO_XML", "QUERY_TO_XML_AND_XMLSCHEMA",
+        // MySQL
+        "LOAD_FILE", "SYS_EXEC", "SYS_EVAL",
+        // Oracle
+        "UTL_HTTP", "UTL_TCP", "UTL_SMTP", "UTL_MAIL", "UTL_FILE", "UTL_INADDR", "DBMS_LDAP",
+        "HTTPURITYPE", "DBMS_PIPE", "DBMS_SCHEDULER", "DBMS_JOB", "DBMS_SQL", "DBMS_XMLGEN",
+        "DBMS_XMLQUERY", "DBMS_AQ", "DBMS_LOCK",
+        // SQL Server
+        "OPENXML", "SP_EXECUTESQL"
     };
 
     public sealed record Verdict(string? Error, string Sql)
@@ -66,10 +88,11 @@ public static class SqlGuard
     private static Verdict Check(string sql, DbProvider provider, bool backslashEscapes)
     {
         List<string> words;
+        List<string> identifiers;
         int? terminator;
         try
         {
-            (words, terminator) = Tokenize(sql, provider, backslashEscapes);
+            (words, identifiers, terminator) = Tokenize(sql, provider, backslashEscapes);
         }
         catch (FormatException ex)
         {
@@ -84,21 +107,33 @@ public static class SqlGuard
             && !first.Equals("WITH", StringComparison.OrdinalIgnoreCase))
             return Deny("Only SELECT queries (including CTEs) are permitted.");
 
-        var denied = words.FirstOrDefault(DeniedKeywords.Contains);
+        var denied = words.FirstOrDefault(w => DeniedKeywords.Contains(w) || DeniedFunctions.Contains(w))
+            ?? identifiers.FirstOrDefault(DeniedFunctions.Contains);
         if (denied is not null)
             return Deny($"'{denied.ToUpperInvariant()}' is not permitted in a read-only query.");
+
+        // SQL Server: NEXT VALUE FOR seq advances a sequence. NEXT alone is fine
+        // (OFFSET ... FETCH NEXT n ROWS).
+        for (int w = 0; w + 2 < words.Count; w++)
+        {
+            if (words[w].Equals("NEXT", StringComparison.OrdinalIgnoreCase)
+                && words[w + 1].Equals("VALUE", StringComparison.OrdinalIgnoreCase)
+                && words[w + 2].Equals("FOR", StringComparison.OrdinalIgnoreCase))
+                return Deny("'NEXT VALUE FOR' is not permitted in a read-only query.");
+        }
 
         return new(null, terminator is int t ? sql[..t] : sql);
     }
 
     /// <summary>
-    /// Returns the bare words outside comments and quotes, and the index of a single
-    /// trailing semicolon if present. Throws <see cref="FormatException"/> for a second
+    /// Returns the bare words outside comments and quotes, the contents of quoted
+    /// identifiers, and the index of a single trailing semicolon if present. Throws <see cref="FormatException"/> for a second
     /// statement, an unterminated literal or comment, or a construct that executes code.
     /// </summary>
-    private static (List<string> Words, int? Terminator) Tokenize(string sql, DbProvider provider, bool backslashEscapes)
+    private static (List<string> Words, List<string> Identifiers, int? Terminator) Tokenize(string sql, DbProvider provider, bool backslashEscapes)
     {
         var words = new List<string>();
+        var identifiers = new List<string>();
         int? terminator = null;
         int i = 0;
         int n = sql.Length;
@@ -158,6 +193,12 @@ public static class SqlGuard
                 continue;
             }
 
+            // Postgres U&"..." spells identifiers with escapes (U&"\0064blink_exec"),
+            // which would hide a denied function name.
+            if (provider == DbProvider.Postgres && (c is 'u' or 'U') && next == '&'
+                && i + 2 < n && sql[i + 2] == '"' && !IsWordChar(Prev(sql, i)))
+                throw new FormatException("Unicode-escaped identifiers (U&\"...\") are not permitted.");
+
             // Postgres E'...' always honours backslash escapes.
             if (provider == DbProvider.Postgres && (c is 'e' or 'E') && next == '\'' && !IsWordChar(Prev(sql, i)))
             {
@@ -176,19 +217,25 @@ public static class SqlGuard
                 // An identifier everywhere except MySQL, where it is a string unless
                 // ANSI_QUOTES is set; either way it ends at the same place for a given
                 // backslash mode.
-                i = SkipQuoted(sql, i, '"', backslash: provider == DbProvider.MySql && backslashEscapes);
+                int end = SkipQuoted(sql, i, '"', backslash: provider == DbProvider.MySql && backslashEscapes);
+                identifiers.Add(Unquote(sql, i, end, '"'));
+                i = end;
                 continue;
             }
 
             if (c == '`' && provider == DbProvider.MySql)
             {
-                i = SkipQuoted(sql, i, '`', backslash: false);
+                int end = SkipQuoted(sql, i, '`', backslash: false);
+                identifiers.Add(Unquote(sql, i, end, '`'));
+                i = end;
                 continue;
             }
 
             if (c == '[' && provider == DbProvider.SqlServer)
             {
-                i = SkipQuoted(sql, i, ']', backslash: false, open: '[');
+                int end = SkipQuoted(sql, i, ']', backslash: false, open: '[');
+                identifiers.Add(Unquote(sql, i, end, ']'));
+                i = end;
                 continue;
             }
 
@@ -211,7 +258,7 @@ public static class SqlGuard
             i++;
         }
 
-        return (words, terminator);
+        return (words, identifiers, terminator);
     }
 
     private static int SkipToEndOfLine(string sql, int i)
@@ -273,6 +320,9 @@ public static class SqlGuard
         }
         throw new FormatException($"Unterminated {(open ?? close)}...{close} literal or identifier.");
     }
+
+    private static string Unquote(string sql, int start, int end, char close) =>
+        sql[(start + 1)..(end - 1)].Replace($"{close}{close}", close.ToString());
 
     private static bool TryDollarQuote(string sql, int i, out int after)
     {

@@ -8,7 +8,8 @@ namespace SqlMcp.Tests;
 /// <summary>
 /// Runs against real databases. Each provider is skipped unless its connection string
 /// is set, e.g. SQLMCP_TEST_POSTGRES="Host=localhost;Username=postgres;Password=pw".
-/// The login must be able to create tables; the tests set up their own fixtures.
+/// The login must be an administrator: the tests create their own fixtures and a
+/// read-only login (sqlmcp_ro) to check the login audit against.
 /// </summary>
 public class QueryServiceIntegrationTests
 {
@@ -26,21 +27,86 @@ public class QueryServiceIntegrationTests
         return new DbConfig("test", provider, cs!);
     }
 
-    private static QueryService Service(DbConfig db, int maxRows = 1000) =>
+    // The admin logins the tests run as can write, so the audit is opted out of unless
+    // a test is about the audit.
+    private static QueryService Service(DbConfig db, int maxRows = 1000, bool allowWritableLogin = true) =>
         new(new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
         {
             ["App:MaxRows"] = maxRows.ToString(),
             ["Databases:0:Name"] = db.Name,
             ["Databases:0:Provider"] = db.Provider.ToString(),
             ["Databases:0:ConnectionString"] = db.ConnectionString,
+            ["Databases:0:AllowWritableLogin"] = allowWritableLogin.ToString(),
         }).Build());
+
+    private const string ReadOnlyUser = "sqlmcp_ro";
+    private const string ReadOnlyPassword = "Ro_passw0rd1";
+
+    /// <summary>
+    /// Creates (once) a login that can only SELECT the fixture table, and returns its
+    /// config plus the schema-qualified table name it should query.
+    /// </summary>
+    private static async Task<(DbConfig Db, string Table)> ReadOnlyLoginAsync(DbConfig admin)
+    {
+        await SeedAsync(admin);
+        await using var conn = await OpenAsync(admin);
+
+        string table;
+        switch (admin.Provider)
+        {
+            case DbProvider.Postgres:
+                await TryExecAsync(conn, $"CREATE ROLE {ReadOnlyUser} LOGIN PASSWORD '{ReadOnlyPassword}'");
+                table = $"public.{Table}";
+                break;
+            case DbProvider.MySql:
+                await ExecAsync(conn, $"CREATE USER IF NOT EXISTS '{ReadOnlyUser}'@'%' IDENTIFIED BY '{ReadOnlyPassword}'");
+                table = $"{conn.Database}.{Table}";
+                break;
+            case DbProvider.SqlServer:
+                await TryExecAsync(conn, $"CREATE LOGIN {ReadOnlyUser} WITH PASSWORD = '{ReadOnlyPassword}'");
+                await TryExecAsync(conn, $"CREATE USER {ReadOnlyUser} FOR LOGIN {ReadOnlyUser}");
+                table = $"dbo.{Table}";
+                break;
+            case DbProvider.Oracle:
+                await TryExecAsync(conn, $"CREATE USER {ReadOnlyUser} IDENTIFIED BY \"{ReadOnlyPassword}\"");
+                await ExecAsync(conn, $"GRANT CREATE SESSION TO {ReadOnlyUser}");
+                await using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT USER FROM dual";
+                    table = $"{await cmd.ExecuteScalarAsync()}.{Table}";
+                }
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(admin));
+        }
+        var database = conn.Database;
+        await ExecAsync(conn, $"GRANT SELECT ON {table} TO {(admin.Provider == DbProvider.MySql ? $"'{ReadOnlyUser}'@'%'" : ReadOnlyUser)}");
+
+        var csb = admin.GetFactory().CreateConnectionStringBuilder()!;
+        csb.ConnectionString = admin.ConnectionString;
+        csb["User Id"] = ReadOnlyUser;
+        csb["Password"] = ReadOnlyPassword;
+        // Postgres otherwise connects to a database named after the user.
+        if (admin.Provider == DbProvider.Postgres)
+            csb["Database"] = database;
+        return (admin with { ConnectionString = csb.ConnectionString }, table);
+    }
+
+    private static async Task<DbConnection> OpenAsync(DbConfig db)
+    {
+        var conn = db.GetFactory().CreateConnection()!;
+        conn.ConnectionString = db.ConnectionString;
+        await conn.OpenAsync();
+        return conn;
+    }
 
     private static string From(DbProvider provider) => provider == DbProvider.Oracle ? " FROM dual" : "";
 
     /// <summary>
     /// Resets the fixture table to ids 1..3 using a direct, writable connection. The table
-    /// is created once and then reseeded with DML only: Oracle refuses a read-only
-    /// transaction on a table whose definition changed moments earlier (ORA-01466).
+    /// is created once and then reseeded with DML only. On a fresh Oracle database the
+    /// first queries hit ORA-01466 (table definition changed moments earlier), which
+    /// exercises QueryService's retry.
     /// </summary>
     private static async Task SeedAsync(DbConfig db, params string[] extra)
     {
@@ -48,41 +114,12 @@ public class QueryServiceIntegrationTests
         conn.ConnectionString = db.ConnectionString;
         await conn.OpenAsync();
 
-        var created = await TryExecAsync(conn, $"CREATE TABLE {Table} (id INT, name VARCHAR(20))");
+        await TryExecAsync(conn, $"CREATE TABLE {Table} (id INT, name VARCHAR(20))");
         await ExecAsync(conn, $"DELETE FROM {Table}");
         foreach (var id in new[] { 1, 2, 3 })
             await ExecAsync(conn, $"INSERT INTO {Table} (id, name) VALUES ({id}, 'row {id}')");
         foreach (var sql in extra)
             await ExecAsync(conn, sql);
-
-        if (created && db.Provider == DbProvider.Oracle)
-            await WaitForOracleSnapshotAsync(conn);
-    }
-
-    private static async Task WaitForOracleSnapshotAsync(DbConnection conn)
-    {
-        for (var attempt = 0; ; attempt++)
-        {
-            await using var tx = await conn.BeginTransactionAsync();
-            try
-            {
-                await using var cmd = conn.CreateCommand();
-                cmd.Transaction = tx;
-                cmd.CommandText = "SET TRANSACTION READ ONLY";
-                await cmd.ExecuteNonQueryAsync();
-                cmd.CommandText = $"SELECT COUNT(*) FROM {Table}";
-                await cmd.ExecuteScalarAsync();
-                return;
-            }
-            catch (DbException ex) when (ex.Message.Contains("ORA-01466") && attempt < 40)
-            {
-                await Task.Delay(250);
-            }
-            finally
-            {
-                await tx.RollbackAsync();
-            }
-        }
     }
 
     private static async Task<long> CountAsync(DbConfig db)
@@ -210,5 +247,148 @@ public class QueryServiceIntegrationTests
         Assert.NotNull(result.Error);
         Assert.Contains(expectedError, result.Error, StringComparison.OrdinalIgnoreCase);
         Assert.Equal(3, await CountAsync(db));
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Audit_flags_an_admin_login(DbProvider provider)
+    {
+        var admin = RequireDb(provider);
+        await using var conn = await OpenAsync(admin);
+
+        var findings = await LoginAudit.FindWriteAccessAsync(conn, provider, CancellationToken.None);
+
+        Assert.NotEmpty(findings);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Audit_passes_a_read_only_login(DbProvider provider)
+    {
+        var (readOnly, _) = await ReadOnlyLoginAsync(RequireDb(provider));
+        await using var conn = await OpenAsync(readOnly);
+
+        var findings = await LoginAudit.FindWriteAccessAsync(conn, provider, CancellationToken.None);
+
+        Assert.True(findings.Count == 0, string.Join(Environment.NewLine, findings));
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Refuses_queries_when_the_login_can_write(DbProvider provider)
+    {
+        var admin = RequireDb(provider);
+
+        var result = await Service(admin, allowWritableLogin: false).ExecuteAsync(new("test", $"SELECT 1 AS one{From(provider)}"));
+
+        Assert.NotNull(result.Error);
+        Assert.Contains("is disabled because its login can modify data", result.Error);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Serves_queries_for_a_read_only_login(DbProvider provider)
+    {
+        var (readOnly, table) = await ReadOnlyLoginAsync(RequireDb(provider));
+
+        var result = await Service(readOnly, allowWritableLogin: false).ExecuteAsync(new("test", $"SELECT id FROM {table}"));
+
+        Assert.Null(result.Error);
+        Assert.Equal(3, result.Value!.Rows.Length);
+    }
+
+    // One grant too many on an otherwise read-only login. Each row is a way the
+    // original gaps could be reached: a write privilege, a function that commits on
+    // its own, a sequence, a way out of the database.
+    [SkippableTheory]
+    [InlineData(DbProvider.Postgres, "can modify tables",
+        new[] { "GRANT INSERT ON public.sqlmcp_fixture TO sqlmcp_ro" },
+        new[] { "REVOKE INSERT ON public.sqlmcp_fixture FROM sqlmcp_ro" })]
+    [InlineData(DbProvider.Postgres, "pg_signal_backend",
+        new[] { "GRANT pg_signal_backend TO sqlmcp_ro" },
+        new[] { "REVOKE pg_signal_backend FROM sqlmcp_ro" })]
+    [InlineData(DbProvider.Postgres, "dblink",
+        new[] { "CREATE EXTENSION IF NOT EXISTS dblink" },
+        new[] { "DROP EXTENSION IF EXISTS dblink" })]
+    [InlineData(DbProvider.MySql, "INSERT",
+        new[] { "GRANT INSERT ON sqlmcp_fixture TO 'sqlmcp_ro'@'%'" },
+        new[] { "REVOKE INSERT ON sqlmcp_fixture FROM 'sqlmcp_ro'@'%'" })]
+    [InlineData(DbProvider.MySql, "FILE",
+        new[] { "GRANT FILE ON *.* TO 'sqlmcp_ro'@'%'" },
+        new[] { "REVOKE FILE ON *.* FROM 'sqlmcp_ro'@'%'" })]
+    [InlineData(DbProvider.MySql, "DELETE",
+        new[] { "CREATE ROLE IF NOT EXISTS sqlmcp_writer", "GRANT DELETE ON sqlmcp_fixture TO sqlmcp_writer",
+                "GRANT sqlmcp_writer TO 'sqlmcp_ro'@'%'", "SET DEFAULT ROLE sqlmcp_writer TO 'sqlmcp_ro'@'%'" },
+        new[] { "DROP ROLE IF EXISTS sqlmcp_writer" })]
+    [InlineData(DbProvider.SqlServer, "can modify tables",
+        new[] { "ALTER ROLE db_datawriter ADD MEMBER sqlmcp_ro" },
+        new[] { "ALTER ROLE db_datawriter DROP MEMBER sqlmcp_ro" })]
+    [InlineData(DbProvider.SqlServer, "sqlmcp_seq",
+        new[] { "CREATE SEQUENCE dbo.sqlmcp_seq", "GRANT UPDATE ON dbo.sqlmcp_seq TO sqlmcp_ro" },
+        new[] { "DROP SEQUENCE dbo.sqlmcp_seq" })]
+    [InlineData(DbProvider.Oracle, "CREATE PROCEDURE",
+        new[] { "GRANT CREATE PROCEDURE TO sqlmcp_ro" },
+        new[] { "REVOKE CREATE PROCEDURE FROM sqlmcp_ro" })]
+    [InlineData(DbProvider.Oracle, "EXECUTE ON",
+        new[] { """
+                CREATE OR REPLACE FUNCTION sqlmcp_autonomous RETURN NUMBER IS
+                  PRAGMA AUTONOMOUS_TRANSACTION;
+                BEGIN
+                  DELETE FROM sqlmcp_fixture;
+                  COMMIT;
+                  RETURN 1;
+                END;
+                """,
+                "GRANT EXECUTE ON sqlmcp_autonomous TO sqlmcp_ro" },
+        new[] { "DROP FUNCTION sqlmcp_autonomous" })]
+    public async Task Audit_flags_a_read_only_login_with_one_extra_grant(
+        DbProvider provider, string expected, string[] grant, string[] revoke)
+    {
+        var (readOnly, _) = await ReadOnlyLoginAsync(RequireDb(provider));
+        await using var admin = await OpenAsync(RequireDb(provider));
+        try
+        {
+            foreach (var sql in grant)
+                await ExecAsync(admin, sql);
+
+            await using var conn = await OpenAsync(readOnly);
+            var findings = await LoginAudit.FindWriteAccessAsync(conn, provider, CancellationToken.None);
+
+            Assert.Contains(findings, f => f.Contains(expected, StringComparison.OrdinalIgnoreCase));
+
+            var result = await Service(readOnly, allowWritableLogin: false).ExecuteAsync(new("test", $"SELECT 1 AS one{From(provider)}"));
+            Assert.Contains("is disabled", result.Error);
+        }
+        finally
+        {
+            foreach (var sql in revoke)
+                await TryExecAsync(admin, sql);
+        }
+    }
+
+    // The read-only setups the README recommends must pass.
+    [SkippableTheory]
+    [InlineData(DbProvider.Postgres, new[] { "GRANT pg_read_all_data TO sqlmcp_ro" }, new[] { "REVOKE pg_read_all_data FROM sqlmcp_ro" })]
+    [InlineData(DbProvider.SqlServer, new[] { "ALTER ROLE db_datareader ADD MEMBER sqlmcp_ro" }, new[] { "ALTER ROLE db_datareader DROP MEMBER sqlmcp_ro" })]
+    [InlineData(DbProvider.MySql, new[] { "GRANT SELECT ON t.* TO 'sqlmcp_ro'@'%'" }, new[] { "REVOKE SELECT ON t.* FROM 'sqlmcp_ro'@'%'" })]
+    public async Task Audit_passes_the_documented_read_only_setups(DbProvider provider, string[] grant, string[] revoke)
+    {
+        var (readOnly, _) = await ReadOnlyLoginAsync(RequireDb(provider));
+        await using var admin = await OpenAsync(RequireDb(provider));
+        try
+        {
+            foreach (var sql in grant)
+                await ExecAsync(admin, sql);
+
+            await using var conn = await OpenAsync(readOnly);
+            var findings = await LoginAudit.FindWriteAccessAsync(conn, provider, CancellationToken.None);
+
+            Assert.True(findings.Count == 0, string.Join(Environment.NewLine, findings));
+        }
+        finally
+        {
+            foreach (var sql in revoke)
+                await TryExecAsync(admin, sql);
+        }
     }
 }

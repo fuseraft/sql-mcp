@@ -161,4 +161,39 @@ public class SqlGuardTests
         var verdict = SqlGuard.Validate("SELECT * INTO t2 FROM t", DbProvider.Postgres);
         Assert.Equal("'INTO' is not permitted in a read-only query.", verdict.Error);
     }
+
+    [Theory]
+    [InlineData(DbProvider.Oracle, "SELECT my_seq.NEXTVAL FROM dual")]
+    [InlineData(DbProvider.Postgres, "SELECT nextval('my_seq')")]
+    [InlineData(DbProvider.Postgres, "SELECT setval('my_seq', 1)")]
+    [InlineData(DbProvider.SqlServer, "SELECT NEXT VALUE FOR dbo.my_seq")]
+    [InlineData(DbProvider.SqlServer, "SELECT next  value\n for my_seq")]
+    public void Denies_sequence_increments(DbProvider provider, string sql) =>
+        Assert.False(SqlGuard.Validate(sql, provider).IsAllowed);
+
+    [Theory]
+    [InlineData(DbProvider.SqlServer, "SELECT id FROM t ORDER BY id OFFSET 10 ROWS FETCH NEXT 10 ROWS ONLY")]
+    [InlineData(DbProvider.Oracle, "SELECT id FROM t ORDER BY id FETCH NEXT 10 ROWS ONLY")]
+    [InlineData(DbProvider.Oracle, "SELECT my_seq.CURRVAL FROM dual")]
+    [InlineData(DbProvider.Postgres, "SELECT 'nextval' AS s, \"next_value\" FROM t")]
+    public void Allows_reads_that_resemble_sequence_calls(DbProvider provider, string sql) =>
+        Assert.True(SqlGuard.Validate(sql, provider).IsAllowed);
+
+    [Theory]
+    [InlineData(DbProvider.Postgres, "SELECT dblink_exec('dbname=app', 'DELETE FROM users')")]
+    [InlineData(DbProvider.Postgres, "SELECT public.dblink('dbname=app', 'SELECT 1') AS t(x int)")]
+    [InlineData(DbProvider.Postgres, "SELECT \"dblink_exec\"('dbname=app', 'DELETE FROM users')")]
+    [InlineData(DbProvider.Postgres, "SELECT U&\"\\0064blink_exec\"('dbname=app', 'DELETE FROM users')")]
+    [InlineData(DbProvider.Postgres, "SELECT pg_read_file('/etc/passwd')")]
+    [InlineData(DbProvider.Postgres, "SELECT pg_terminate_backend(123)")]
+    [InlineData(DbProvider.Postgres, "SELECT query_to_xml('DELETE FROM users RETURNING *', true, true, '')")]
+    [InlineData(DbProvider.MySql, "SELECT LOAD_FILE('/etc/passwd')")]
+    [InlineData(DbProvider.MySql, "SELECT `load_file`('/etc/passwd')")]
+    [InlineData(DbProvider.Oracle, "SELECT UTL_HTTP.REQUEST('http://example.com') FROM dual")]
+    [InlineData(DbProvider.Oracle, "SELECT \"UTL_HTTP\".\"REQUEST\"('http://example.com') FROM dual")]
+    [InlineData(DbProvider.Oracle, "SELECT DBMS_XMLGEN.GETXML('SELECT * FROM users') FROM dual")]
+    [InlineData(DbProvider.SqlServer, "SELECT * FROM OPENXML(@h, '/root')")]
+    [InlineData(DbProvider.SqlServer, "SELECT [sp_executesql]")]
+    public void Denies_functions_that_reach_outside_or_hide_sql(DbProvider provider, string sql) =>
+        Assert.False(SqlGuard.Validate(sql, provider).IsAllowed);
 }

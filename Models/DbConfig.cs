@@ -18,7 +18,8 @@ public record DbConfig(
     string Name,
     DbProvider Provider,
     string ConnectionString,
-    string? PasswordEnvVar = null)
+    string? PasswordEnvVar = null,
+    bool AllowWritableLogin = false)
 {
     public DbProviderFactory GetFactory() => Provider switch
     {
