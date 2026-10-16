@@ -6,6 +6,17 @@ using SqlMcp.Services;
 // appsettings.json next to the executable rather than relative to the cwd.
 var contentRoot = AppContext.BaseDirectory;
 
+if (args.Contains("--healthcheck"))
+{
+    var config = new ConfigurationBuilder()
+        .SetBasePath(contentRoot)
+        .AddJsonFile("appsettings.json", optional: true)
+        .AddEnvironmentVariables()
+        .AddCommandLine(args.Where(a => a != "--healthcheck").ToArray())
+        .Build();
+    return await HealthCheck.RunAsync(config);
+}
+
 if (args.Contains("--stdio"))
 {
     var builder = Host.CreateApplicationBuilder(new HostApplicationBuilderSettings
@@ -53,7 +64,18 @@ else
 
     app.MapMcp("/mcp");
 
+    // Liveness: the process is up. Open, so probes need no token.
     app.MapGet("/health", () => Results.Ok(new { status = "healthy" }));
+
+    // Readiness: every database connects and passes the login audit. Requires the
+    // token when one is set, since it names the databases and why any are down.
+    app.MapGet("/health/ready", async (QueryService svc, CancellationToken ct) =>
+    {
+        var databases = await svc.CheckDatabasesAsync(ct);
+        var ready = databases.Values.All(v => v == "ok");
+        return Results.Json(new { status = ready ? "ready" : "unavailable", databases },
+            statusCode: ready ? StatusCodes.Status200OK : StatusCodes.Status503ServiceUnavailable);
+    });
 
     app.MapPost("/api/query", async (QueryService svc, QueryRequest req, CancellationToken ct) =>
     {
@@ -66,6 +88,8 @@ else
     var urls = app.Configuration["App:Urls"] ?? HttpSecurity.DefaultUrls;
     await app.RunAsync(urls);
 }
+
+return 0;
 
 // Resolving QueryService validates the config, so a bad one stops the server before it
 // serves anything, with the problems listed and no stack trace.

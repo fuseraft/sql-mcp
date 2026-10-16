@@ -241,7 +241,15 @@ curl -s http://localhost:8080/mcp \
 
 ### Health check
 
-**`GET /health`** (HTTP mode only) — returns `200 {"status":"healthy"}`. Suitable for load balancer and orchestrator probes.
+**`GET /health`** (HTTP mode only): liveness. Returns `200 {"status":"healthy"}` while the process is up, and needs no token, so it suits load balancer and liveness probes.
+
+**`GET /health/ready`** (HTTP mode only): readiness. Connects to every configured database, runs the login audit and opens the read-only transaction, without running a query. It returns `200` when all of them succeed, otherwise `503`, with each database's status:
+
+```json
+{ "status": "unavailable", "databases": { "prod": "ok", "reporting": "Database 'reporting' is disabled because its login can modify data. The server log lists why." } }
+```
+
+It requires the bearer token when `App:AuthToken` is set, since it names the databases. Readiness checks aren't written to the query log.
 
 ---
 
@@ -314,7 +322,7 @@ docker run -p 8080:8080 \
   sql-mcp
 ```
 
-The image listens on all interfaces inside the container, so it won't start without `App__AuthToken`.
+The image listens on all interfaces inside the container, so it won't start without `App__AuthToken`. It runs as the base image's unprivileged `app` user (uid 1654), so a mounted `appsettings.json` must be readable by that user. Its `HEALTHCHECK` runs `dotnet sql-mcp.dll --healthcheck`, which calls `/health` on the configured port and exits 0 or 1. Use the same command for health checks anywhere curl isn't installed.
 
 ### Linux — systemd service
 
@@ -361,10 +369,12 @@ sql-mcp/
 ├── Tools/SqlTools.cs                 # MCP tool definitions
 ├── Services/QueryService.cs          # Query execution, read-only transaction, row limiting
 ├── Services/QueryParameters.cs       # Bind-parameter parsing and binding
+├── Services/ResultValues.cs          # Converts database values to plain JSON
 ├── Services/SchemaCatalog.cs         # Per-provider catalog queries for list_tables / describe_table
 ├── Services/SqlGuard.cs              # Provider-aware statement validation
 ├── Services/LoginAudit.cs            # Per-provider check that the login can only read
 ├── Http/HttpSecurity.cs              # Bearer token, Origin check, safe binding
+├── Http/HealthCheck.cs               # --healthcheck mode for container probes
 ├── Models/
 │   ├── DbConfig.cs                   # Database config model
 │   ├── QueryRequest.cs               # Request DTO
@@ -376,6 +386,7 @@ sql-mcp/
 ├── appsettings.json                  # Default config
 ├── appsettings.Production.json       # Production log levels
 ├── Dockerfile
+├── .github/workflows/ci.yml          # Build, tests against all four databases, image smoke test
 └── tests/SqlMcp.Tests/               # Validator unit tests, database integration tests
 ```
 
@@ -398,3 +409,8 @@ dotnet test
 ```
 
 (MySQL with binary logging enabled also needs `log_bin_trust_function_creators=1` to create the test function.)
+
+CI (`.github/workflows/ci.yml`) runs the same suite on every push and pull request, against Postgres 16, MySQL 8.4, SQL Server 2022 and Oracle 23 Free service containers. The job fails if any test is skipped, so a database that didn't start can't let it pass. CI also builds with warnings treated as errors, fails on vulnerable packages, and checks that the Docker image:
+- refuses to start without a token
+- serves `/health` and returns 401 on `/mcp` without the token
+- runs as non-root

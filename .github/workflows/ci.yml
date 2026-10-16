@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build and test against all four databases
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: pw
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-retries 30
+
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: pw
+          MYSQL_DATABASE: t
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -ppw" --health-interval 5s --health-retries 30
+
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: Str0ng!Passw0rd
+        ports: ["1433:1433"]
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Str0ng!Passw0rd' -C -Q 'SELECT 1'"
+          --health-interval 10s --health-retries 30
+
+      oracle:
+        image: gvenzl/oracle-free:23-slim-faststart
+        env:
+          ORACLE_PASSWORD: pw
+        ports: ["1521:1521"]
+        options: >-
+          --health-cmd healthcheck.sh --health-interval 10s --health-retries 60
+
+    env:
+      DOTNET_NOLOGO: "true"
+      SQLMCP_TEST_POSTGRES: Host=localhost;Port=5432;Username=postgres;Password=pw
+      SQLMCP_TEST_MYSQL: Server=localhost;Port=3306;Database=t;User Id=root;Password=pw
+      SQLMCP_TEST_SQLSERVER: Server=localhost,1433;User Id=sa;Password=Str0ng!Passw0rd;TrustServerCertificate=true
+      SQLMCP_TEST_ORACLE: Data Source=localhost:1521/FREEPDB1;User Id=system;Password=pw
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      # Service containers can't take server flags; the tests create a function with binary logging on.
+      - name: Allow MySQL function creation
+        run: docker exec ${{ job.services.mysql.id }} mysql -uroot -ppw -e "SET GLOBAL log_bin_trust_function_creators = 1"
+
+      - run: dotnet restore sql-mcp.sln
+
+      - run: dotnet build sql-mcp.sln --no-restore -c Release -warnaserror
+
+      - name: Check for vulnerable packages
+        run: |
+          dotnet list sql-mcp.sln package --vulnerable --include-transitive | tee vulnerable.txt
+          ! grep -q "has the following vulnerable packages" vulnerable.txt
+
+      # Fails if any integration test was skipped, so a database that didn't come up can't pass silently.
+      - name: Test
+        run: |
+          dotnet test sql-mcp.sln --no-build -c Release | tee test.txt
+          grep -qE "Skipped: +0," test.txt
+
+  docker:
+    name: Build and smoke-test the image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - run: docker build -t sql-mcp .
+
+      - name: Refuses to start without a token
+        run: "! docker run --rm sql-mcp"
+
+      - name: Serves health, rejects requests without the token, runs as non-root
+        run: |
+          docker run -d --name app -e App__AuthToken=ci-token -p 8080:8080 sql-mcp
+          for i in $(seq 30); do curl -sf localhost:8080/health && break; sleep 1; done
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/health)" = 200
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8080/mcp)" = 401
+          test "$(docker exec app id -u)" != 0
+          docker exec app dotnet sql-mcp.dll --healthcheck

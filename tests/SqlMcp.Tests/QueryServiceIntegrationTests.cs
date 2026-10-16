@@ -810,4 +810,14 @@ public class QueryServiceIntegrationTests
                 Messages.Add((logLevel, formatter(state, exception)));
         }
     }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Readiness_check_passes_a_reachable_database_and_reports_a_writable_login(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+
+        Assert.Equal("ok", (await Service(db).CheckDatabasesAsync())["test"]);
+        Assert.Contains("is disabled", (await Service(db, allowWritableLogin: false).CheckDatabasesAsync())["test"]);
+    }
 }
