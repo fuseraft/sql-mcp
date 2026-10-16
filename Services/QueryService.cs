@@ -41,19 +41,96 @@ public class QueryService
         if (string.IsNullOrWhiteSpace(req.DbName) || req.Sql is null)
             return new(null!, "Both dbName and sql are required.");
 
-        var db = _dbs.FirstOrDefault(d => d.Name == req.DbName);
+        var db = FindDatabase(req.DbName);
         if (db == null)
-            return new(null!, $"Unknown database '{req.DbName}'. Call list_databases to see available names.");
+            return new(null!, UnknownDatabase(req.DbName));
 
         var verdict = SqlGuard.Validate(req.Sql, db.Provider);
         if (!verdict.IsAllowed)
             return new(null!, verdict.Error!);
 
+        return await RunAsync(db, async newCommand =>
+        {
+            await using var cmd = newCommand();
+            cmd.CommandText = verdict.Sql;
+            return await ReadResultAsync(cmd, ct);
+        }, ct);
+    }
+
+    /// <summary>
+    /// Lists the tables and views the login can read, optionally in one schema.
+    /// </summary>
+    public async Task<Result<TableList, string>> ListTablesAsync(string dbName, string? schema, CancellationToken ct = default)
+    {
+        var db = FindDatabase(dbName);
+        if (db == null)
+            return new(null!, UnknownDatabase(dbName));
+
+        return await RunAsync(db, async newCommand =>
+        {
+            var tables = await SchemaCatalog.FindTablesAsync(newCommand, db.Provider, NullIfBlank(schema), null, _maxRows, ct);
+            return tables.Count > _maxRows
+                ? new TableList([.. tables.Take(_maxRows)], Truncated: true)
+                : new TableList([.. tables]);
+        }, ct);
+    }
+
+    /// <summary>
+    /// Returns a table's columns. Names match case-insensitively; without a schema the
+    /// table is looked up across all non-system schemas, and "schema.table" is accepted.
+    /// </summary>
+    public async Task<Result<TableDescription, string>> DescribeTableAsync(
+        string dbName, string table, string? schema, CancellationToken ct = default)
+    {
+        var db = FindDatabase(dbName);
+        if (db == null)
+            return new(null!, UnknownDatabase(dbName));
+        if (string.IsNullOrWhiteSpace(table))
+            return new(null!, "table is required.");
+
+        table = table.Trim();
+        schema = NullIfBlank(schema);
+        int dot = table.IndexOf('.');
+        if (schema is null && dot > 0 && dot < table.Length - 1)
+            (schema, table) = (table[..dot], table[(dot + 1)..]);
+
+        string? notFound = null;
+        var result = await RunAsync(db, async newCommand =>
+        {
+            var matches = await SchemaCatalog.FindTablesAsync(newCommand, db.Provider, schema, table, 50, ct);
+
+            // "Orders" and "orders" can both exist; an exact match settles it.
+            if (matches.Count > 1 && matches.Count(m => m.Name == table && (schema is null || m.Schema == schema)) == 1)
+                matches = [matches.Single(m => m.Name == table && (schema is null || m.Schema == schema))];
+
+            if (matches.Count != 1)
+            {
+                var name = schema is null ? table : $"{schema}.{table}";
+                notFound = matches.Count == 0
+                    ? $"Table '{name}' was not found in database '{db.Name}', or the login can't read it. Call list_tables to see what it can read."
+                    : $"'{name}' matches more than one table: {string.Join(", ", matches.Select(m => $"{m.Schema}.{m.Name}"))}. Pass schema to choose one.";
+                return null!;
+            }
+
+            var match = matches[0];
+            var columns = await SchemaCatalog.GetColumnsAsync(newCommand, db.Provider, match, ct);
+            return new TableDescription(match.Schema, match.Name, match.Type, columns);
+        }, ct);
+
+        return notFound is null ? result : new(null!, notFound);
+    }
+
+    /// <summary>
+    /// Connects, checks the login, and runs work inside a read-only transaction that is
+    /// always rolled back. Commands from newCommand are bound to that transaction.
+    /// </summary>
+    private async Task<Result<T, string>> RunAsync<T>(DbConfig db, Func<Func<DbCommand>, Task<T>> work, CancellationToken ct)
+    {
         for (int attempt = 0; ; attempt++)
         {
             try
             {
-                return await ExecuteOnceAsync(db, verdict.Sql, ct);
+                return await RunOnceAsync(db, work, ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -65,29 +142,30 @@ public class QueryService
             }
             catch (Exception ex)
             {
-                return new(null!, $"Query error: {ex.Message}");
+                return new(default, $"Query error: {ex.Message}");
             }
         }
     }
 
-    private async Task<Result<QueryResult, string>> ExecuteOnceAsync(DbConfig db, string sql, CancellationToken ct)
+    private async Task<Result<T, string>> RunOnceAsync<T>(DbConfig db, Func<Func<DbCommand>, Task<T>> work, CancellationToken ct)
     {
         await using var conn = db.GetFactory().CreateConnection()!;
         conn.ConnectionString = ResolveConnectionString(db);
         await conn.OpenAsync(ct);
 
         if (!await IsLoginReadOnlyAsync(db, conn, ct))
-            return new(null!, $"Database '{db.Name}' is disabled because its login can modify data. The server log lists why.");
+            return new(default, $"Database '{db.Name}' is disabled because its login can modify data. The server log lists why.");
 
         await using var tx = await BeginReadOnlyTransactionAsync(conn, db.Provider, ct);
         try
         {
-            await using var cmd = conn.CreateCommand();
-            cmd.CommandText = sql;
-            cmd.Transaction = tx;
-            cmd.CommandTimeout = _queryTimeoutSeconds;
-
-            return new(await ReadResultAsync(cmd, ct), null!);
+            return new(await work(() =>
+            {
+                var cmd = conn.CreateCommand();
+                cmd.Transaction = tx;
+                cmd.CommandTimeout = _queryTimeoutSeconds;
+                return cmd;
+            }), null!);
         }
         finally
         {
@@ -95,6 +173,13 @@ public class QueryService
             await RollbackQuietlyAsync(tx);
         }
     }
+
+    private DbConfig? FindDatabase(string? name) => _dbs.FirstOrDefault(d => d.Name == name);
+
+    private static string UnknownDatabase(string? name) =>
+        $"Unknown database '{name}'. Call list_databases to see available names.";
+
+    private static string? NullIfBlank(string? s) => string.IsNullOrWhiteSpace(s) ? null : s.Trim();
 
     private async Task<bool> IsLoginReadOnlyAsync(DbConfig db, DbConnection conn, CancellationToken ct)
     {
