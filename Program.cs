@@ -1,3 +1,4 @@
+using SqlMcp.Http;
 using SqlMcp.Models;
 using SqlMcp.Services;
 
@@ -41,6 +42,9 @@ else
 
     var app = builder.Build();
 
+    HttpSecurity.ValidateStartup(app.Configuration);
+    app.UseHttpSecurity();
+
     app.MapMcp("/mcp");
 
     app.MapGet("/health", () => Results.Ok(new { status = "healthy" }));
@@ -53,6 +57,9 @@ else
         return Results.Ok(result.Value);
     });
 
-    var urls = app.Configuration["App:Urls"] ?? "http://*:8080";
+    var urls = app.Configuration["App:Urls"] ?? HttpSecurity.DefaultUrls;
     await app.RunAsync(urls);
 }
+
+// Visible to WebApplicationFactory in the tests.
+public partial class Program;
