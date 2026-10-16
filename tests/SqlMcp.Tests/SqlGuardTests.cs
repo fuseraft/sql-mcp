@@ -196,4 +196,12 @@ public class SqlGuardTests
     [InlineData(DbProvider.SqlServer, "SELECT [sp_executesql]")]
     public void Denies_functions_that_reach_outside_or_hide_sql(DbProvider provider, string sql) =>
         Assert.False(SqlGuard.Validate(sql, provider).IsAllowed);
+
+    [Theory]
+    [InlineData(DbProvider.SqlServer, "SELECT * FROM t WHERE name = @name AND id > @min_id")]
+    [InlineData(DbProvider.Postgres, "SELECT * FROM t WHERE name = @name AND id > @min_id")]
+    [InlineData(DbProvider.MySql, "SELECT * FROM t WHERE name = @name AND id > @min_id")]
+    [InlineData(DbProvider.Oracle, "SELECT * FROM t WHERE name = :name AND id > :min_id")]
+    public void Allows_parameter_placeholders(DbProvider provider, string sql) =>
+        Assert.True(SqlGuard.Validate(sql, provider).IsAllowed);
 }
