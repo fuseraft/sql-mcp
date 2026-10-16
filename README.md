@@ -145,7 +145,7 @@ Returns the names of all configured databases as a JSON array, e.g. `["prod","re
 | Argument | Type | Description |
 |----------|------|-------------|
 | `dbName` | string | Database name from `list_databases`. |
-| `sql` | string | Query to execute. Only `SELECT` and `WITH` (CTE) statements are accepted. |
+| `sql` | string | A single `SELECT` or `WITH` query. See [Security](#security). |
 
 Returns the result as JSON text:
 
@@ -178,9 +178,26 @@ curl -s http://localhost:8080/mcp \
 
 ## Security
 
-- Only `SELECT` and `WITH` (CTE) queries are executed. All other statements are rejected at the application layer.
-- **Grant database users read-only access.** This is the primary enforcement layer — the application-level check is defence in depth.
-- Passwords are never stored in the process environment directly; the `{password}` substitution pattern keeps connection strings safe to commit while keeping credentials out.
+Queries come from AI agents, so every query passes three layers before anything reaches your data. The first two are built in. The third is yours to configure, and it matters most.
+
+1. **Statement validation.** Before connecting, each query is tokenized using that database's own rules for comments, string literals and quoted identifiers (Postgres dollar quotes and nested comments, MySQL backticks and `#` comments, Oracle `q'[...]'` quotes, SQL Server `[brackets]`). A query is accepted only if it:
+   - is a single statement starting with `SELECT` or `WITH` (one trailing `;` is allowed and stripped),
+   - contains no data-modifying or session-control keywords outside literals, such as `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `INTO`, `FOR UPDATE`, `EXEC`, `SET`, `COMMIT` or `GRANT`, so `SELECT * INTO copy ...`, `WITH d AS (DELETE ...)` and SQL Server batches like `SELECT 1 DROP TABLE t` are all rejected,
+   - has no unterminated literal or comment, and no MySQL executable comment (`/*! ... */`).
+
+   Where a server setting changes how backslashes inside literals are read (MySQL `NO_BACKSLASH_ESCAPES`, Postgres `standard_conforming_strings`), the query must pass under both readings, so it can't hide text from the check.
+
+2. **Read-only transaction, always rolled back.** Every query runs inside a transaction that is rolled back afterwards, whatever happens. On Postgres, MySQL and Oracle that transaction is also read-only (`SET TRANSACTION READ ONLY` / `START TRANSACTION READ ONLY`), so the database itself refuses writes that validation can't see, such as `SELECT my_function_that_inserts()`. SQL Server has no read-only transaction mode, so there the rollback is the backstop. (On Oracle, a read-only transaction reads from a consistent snapshot, so a query on a table altered within the last few seconds can fail with `ORA-01466`. Retrying shortly afterwards works.)
+
+3. **A read-only database login.** This is the primary control. Some things neither layer above can stop: a function with its own autonomous transaction (Oracle `PRAGMA AUTONOMOUS_TRANSACTION`), a sequence increment on Oracle or SQL Server (`NEXTVAL`, `NEXT VALUE FOR`), or a call that has effects outside the database (`dblink`, extended procedures, file functions like `LOAD_FILE`). Grant the configured user `SELECT` on what agents should see and nothing else:
+   - Postgres: the `pg_read_all_data` role, or `GRANT SELECT` per schema
+   - MySQL: `GRANT SELECT ON db.* TO ...`
+   - SQL Server: the `db_datareader` role
+   - Oracle: `GRANT SELECT` on specific objects; avoid `SELECT ANY TABLE`
+
+**Credentials.** Connection strings can be committed safely: put `{password}` where the password goes and name the environment variable to fill it from with `PasswordEnvVar`.
+
+**Network.** The HTTP transport has no authentication of its own. Bind it to localhost (`App__Urls=http://127.0.0.1:8080`) or put it behind a proxy that authenticates. The stdio transport is only reachable by the process that launched it.
 
 ---
 
@@ -252,7 +269,8 @@ Set passwords via system environment variables or an `appsettings.Production.jso
 sql-mcp/
 ├── Program.cs                        # Transport selection (stdio / HTTP), endpoints
 ├── Tools/SqlTools.cs                 # MCP tool definitions
-├── Services/QueryService.cs          # Query execution, validation, row limiting
+├── Services/QueryService.cs          # Query execution, read-only transaction, row limiting
+├── Services/SqlGuard.cs              # Provider-aware statement validation
 ├── Models/
 │   ├── DbConfig.cs                   # Database config model
 │   ├── QueryRequest.cs               # Request DTO
@@ -262,5 +280,26 @@ sql-mcp/
 │   └── win-x64.pubxml
 ├── appsettings.json                  # Default config
 ├── appsettings.Production.json       # Production log levels
-└── Dockerfile
+├── Dockerfile
+└── tests/SqlMcp.Tests/               # Validator unit tests, database integration tests
 ```
+
+---
+
+## Testing
+
+```bash
+dotnet test
+```
+
+The validator unit tests always run. The integration tests run against each database whose connection string is set, and are skipped otherwise. The login needs permission to create a table and, for Postgres and MySQL, a function:
+
+```bash
+export SQLMCP_TEST_POSTGRES='Host=localhost;Username=postgres;Password=pw'
+export SQLMCP_TEST_MYSQL='Server=localhost;Database=test;User Id=root;Password=pw'
+export SQLMCP_TEST_SQLSERVER='Server=localhost;User Id=sa;Password=pw;TrustServerCertificate=true'
+export SQLMCP_TEST_ORACLE='Data Source=localhost:1521/FREEPDB1;User Id=test;Password=pw'
+dotnet test
+```
+
+(MySQL with binary logging enabled also needs `log_bin_trust_function_creators=1` to create the test function.)

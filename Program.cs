@@ -1,15 +1,5 @@
 using SqlMcp.Models;
 using SqlMcp.Services;
-using System.Data.Common;
-using Microsoft.Data.SqlClient;
-using Oracle.ManagedDataAccess.Client;
-using Npgsql;
-using MySqlConnector;
-
-DbProviderFactories.RegisterFactory("Microsoft.Data.SqlClient", SqlClientFactory.Instance);
-DbProviderFactories.RegisterFactory("Oracle.ManagedDataAccess.Client", OracleClientFactory.Instance);
-DbProviderFactories.RegisterFactory("Npgsql", NpgsqlFactory.Instance);
-DbProviderFactories.RegisterFactory("MySqlConnector", MySqlConnectorFactory.Instance);
 
 // MCP clients launch stdio servers from their own working directory, so resolve
 // appsettings.json next to the executable rather than relative to the cwd.
