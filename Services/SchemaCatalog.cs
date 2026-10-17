@@ -1,4 +1,3 @@
-using Oracle.ManagedDataAccess.Client;
 using SqlMcp.Models;
 using System.Data.Common;
 
@@ -139,10 +138,10 @@ public static class SchemaCatalog
               AND ({p}p_any_table = 1 OR LOWER(table_name) = LOWER({p}p_table))
             ORDER BY schema_name, table_name
             """;
-        AddParameter(cmd, provider, "p_any_schema", schema is null ? 1 : 0);
-        AddParameter(cmd, provider, "p_schema", schema ?? "");
-        AddParameter(cmd, provider, "p_any_table", table is null ? 1 : 0);
-        AddParameter(cmd, provider, "p_table", table ?? "");
+        QueryParameters.Add(cmd, provider, "p_any_schema", schema is null ? 1 : 0);
+        QueryParameters.Add(cmd, provider, "p_schema", schema ?? "");
+        QueryParameters.Add(cmd, provider, "p_any_table", table is null ? 1 : 0);
+        QueryParameters.Add(cmd, provider, "p_table", table ?? "");
 
         var tables = new List<TableInfo>();
         await using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -164,8 +163,8 @@ public static class SchemaCatalog
             DbProvider.Oracle => OracleColumns,
             _ => throw new ArgumentOutOfRangeException(nameof(provider))
         };
-        AddParameter(cmd, provider, "p_schema", table.Schema);
-        AddParameter(cmd, provider, "p_table", table.Name);
+        QueryParameters.Add(cmd, provider, "p_schema", table.Schema);
+        QueryParameters.Add(cmd, provider, "p_table", table.Name);
 
         var columns = new List<ColumnInfo>();
         await using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -178,16 +177,5 @@ public static class SchemaCatalog
                 Convert.ToInt32(reader.GetValue(3)) == 1));
         }
         return [.. columns];
-    }
-
-    private static void AddParameter(DbCommand cmd, DbProvider provider, string name, object value)
-    {
-        if (cmd is OracleCommand oracle)
-            oracle.BindByName = true;
-
-        var parameter = cmd.CreateParameter();
-        parameter.ParameterName = provider == DbProvider.Oracle ? name : "@" + name;
-        parameter.Value = value;
-        cmd.Parameters.Add(parameter);
     }
 }

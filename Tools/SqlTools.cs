@@ -39,12 +39,16 @@ public sealed class SqlTools(QueryService svc)
         Serialize(await svc.DescribeTableAsync(dbName, table, schema, cancellationToken));
 
     [McpServerTool(Name = "query_database", ReadOnly = true)]
-    [Description("Execute a read-only SELECT query on the specified database and return the columns and rows as JSON.")]
+    [Description("Execute a read-only SELECT query on the specified database and return the columns and rows as JSON. " +
+                 "Pass values through parameters rather than writing them into the SQL: they are bound by the database, " +
+                 "so quotes in values need no escaping and can't change the query.")]
     public async Task<string> QueryDatabase(
         [Description("Database name from list_databases.")] string dbName,
-        [Description("SELECT query to execute.")] string sql,
+        [Description("SELECT query to execute. Refer to parameters as @name on SQL Server, Postgres and MySQL, and as :name on Oracle.")] string sql,
+        [Description("Values for the query's placeholders, by name without the @ or :, e.g. {\"customer\": \"O'Brien\", \"minTotal\": 100}. " +
+                     "Values may be strings, numbers, booleans or null. Optional.")] Dictionary<string, JsonElement>? parameters = null,
         CancellationToken cancellationToken = default) =>
-        Serialize(await svc.ExecuteAsync(new QueryRequest(dbName, sql), cancellationToken));
+        Serialize(await svc.ExecuteAsync(new QueryRequest(dbName, sql, parameters), cancellationToken));
 
     private static string Serialize<T>(QueryService.Result<T, string> result)
     {
