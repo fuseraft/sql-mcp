@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using SqlMcp.Models;
 using SqlMcp.Services;
 using System.Data.Common;
@@ -30,15 +31,21 @@ public class QueryServiceIntegrationTests
 
     // The admin logins the tests run as can write, so the audit is opted out of unless
     // a test is about the audit.
-    private static QueryService Service(DbConfig db, int maxRows = 1000, bool allowWritableLogin = true) =>
-        new(new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+    private static QueryService Service(DbConfig db, int maxRows = 1000, bool allowWritableLogin = true,
+        Dictionary<string, string?>? settings = null, ILogger<QueryService>? logger = null)
+    {
+        var config = new Dictionary<string, string?>
         {
             ["App:MaxRows"] = maxRows.ToString(),
             ["Databases:0:Name"] = db.Name,
             ["Databases:0:Provider"] = db.Provider.ToString(),
             ["Databases:0:ConnectionString"] = db.ConnectionString,
             ["Databases:0:AllowWritableLogin"] = allowWritableLogin.ToString(),
-        }).Build());
+        };
+        foreach (var (key, value) in settings ?? [])
+            config[key] = value;
+        return new(new ConfigurationBuilder().AddInMemoryCollection(config).Build(), logger);
+    }
 
     private const string ReadOnlyUser = "sqlmcp_ro";
     private const string ReadOnlyPassword = "Ro_passw0rd1";
@@ -676,5 +683,131 @@ public class QueryServiceIntegrationTests
         var result = await Service(db).ExecuteAsync(Query($"SELECT 1 AS one{From(provider)}", """{"a b": 1}"""));
 
         Assert.Contains("invalid", result.Error);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Keeps_every_value_when_column_names_repeat(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+
+        var result = await Service(db).ExecuteAsync(new("test", $"SELECT 1 AS a, 2 AS a, 3 AS b{From(provider)}"));
+
+        Assert.True(result.Error is null, result.Error);
+        Assert.Equal(["a", "a_2", "b"], result.Value!.Columns.Select(c => c.ToLowerInvariant()));
+        Assert.Equal([1, 2, 3], result.Value.Rows.Single().Values.Select(Convert.ToInt32));
+    }
+
+    [SkippableTheory]
+    [InlineData(DbProvider.Postgres, "SELECT 1, 2")]
+    [InlineData(DbProvider.SqlServer, "SELECT 1, 2")]
+    public async Task Names_unnamed_columns(DbProvider provider, string sql)
+    {
+        var db = RequireDb(provider);
+
+        var result = await Service(db).ExecuteAsync(new("test", sql));
+
+        Assert.Equal(["column1", "column2"], result.Value!.Columns);
+    }
+
+    [SkippableTheory]
+    [InlineData(DbProvider.Postgres, "SELECT repeat('x', 500) AS v")]
+    [InlineData(DbProvider.MySql, "SELECT REPEAT('x', 500) AS v")]
+    [InlineData(DbProvider.SqlServer, "SELECT REPLICATE('x', 500) AS v")]
+    [InlineData(DbProvider.Oracle, "SELECT RPAD('x', 500, 'x') AS v FROM dual")]
+    public async Task Truncates_long_values(DbProvider provider, string sql)
+    {
+        var db = RequireDb(provider);
+
+        var result = await Service(db, settings: new() { ["App:MaxValueLength"] = "100" }).ExecuteAsync(new("test", sql));
+
+        var value = Assert.IsType<string>(result.Value!.Rows.Single().Values.Single());
+        Assert.StartsWith(new string('x', 100) + "…", value);
+        Assert.Contains("[truncated: 500 characters in total]", value);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Stops_adding_rows_at_the_result_size_limit(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+        await SeedAsync(db);
+
+        var result = await Service(db, settings: new() { ["App:MaxResultBytes"] = "60" })
+            .ExecuteAsync(new("test", $"SELECT id, name FROM {Table} ORDER BY id"));
+
+        Assert.True(result.Error is null, result.Error);
+        Assert.InRange(result.Value!.Rows.Length, 1, 2);
+        Assert.True(result.Value.Truncated);
+    }
+
+    // Each of these failed the whole query, or threw while serializing it.
+    [SkippableTheory]
+    [InlineData(DbProvider.Oracle, "SELECT 1/3 AS v FROM dual", "0.33333")]
+    [InlineData(DbProvider.Oracle, "SELECT 123456789012345678901234567890123456789 AS v FROM dual", "123456789012345678901234567890123456789")]
+    [InlineData(DbProvider.Oracle, "SELECT BINARY_DOUBLE_NAN AS v FROM dual", "\"NaN\"")]
+    [InlineData(DbProvider.Postgres, "SELECT 'NaN'::float8 AS v", "\"NaN\"")]
+    [InlineData(DbProvider.Postgres, "SELECT '-infinity'::float8 AS v", "\"-Infinity\"")]
+    [InlineData(DbProvider.Postgres, "SELECT '10.0.0.1'::inet AS v", "\"10.0.0.1\"")]
+    [InlineData(DbProvider.Postgres, "SELECT ARRAY[1, 2] AS v", "[1,2]")]
+    [InlineData(DbProvider.Postgres, "SELECT int4range(1, 5) AS v", "\"[1,5)\"")]
+    [InlineData(DbProvider.Postgres, "SELECT B'101' AS v", "\"101\"")]
+    [InlineData(DbProvider.Postgres, "SELECT 'NaN'::numeric AS v", "Convert it to a string in the query")]
+    [InlineData(DbProvider.SqlServer, "SELECT geography::Point(1, 2, 4326) AS v", "Convert it to a string in the query")]
+    public async Task Returns_awkward_values_as_json(DbProvider provider, string sql, string expected)
+    {
+        var db = RequireDb(provider);
+
+        var result = await Service(db).ExecuteAsync(new("test", sql));
+
+        Assert.True(result.Error is null, result.Error);
+        var json = JsonSerializer.Serialize(result.Value!.Rows.Single().Values.Single());
+        Assert.Contains(expected, json);
+    }
+
+    [SkippableFact]
+    public async Task Rejects_queries_beyond_the_concurrency_limit()
+    {
+        var db = RequireDb(DbProvider.Postgres);
+        var svc = Service(db, settings: new() { ["App:MaxConcurrentQueries"] = "1", ["App:QueryTimeoutSeconds"] = "3" });
+
+        // One slot: the first holds it for 2.5 s, the second gets it after waiting, and
+        // the third would have to wait past the 3 s timeout.
+        var results = await Task.WhenAll(Enumerable.Range(0, 3).Select(async i =>
+        {
+            await Task.Delay(i * 100);
+            return await svc.ExecuteAsync(new("test", "SELECT pg_sleep(2.5) AS s"));
+        }));
+
+        Assert.Null(results[0].Error);
+        Assert.Contains(results, r => r.Error?.Contains("is busy") == true);
+    }
+
+    [SkippableFact]
+    public async Task Logs_each_query_without_parameter_values()
+    {
+        var db = RequireDb(DbProvider.Postgres);
+        var logger = new ListLogger();
+
+        await Service(db, logger: logger).ExecuteAsync(Query("SELECT @secret AS v", """{"secret": "hunter2"}"""));
+        await Service(db, logger: logger).ExecuteAsync(new("test", "SELECT * FROM sqlmcp_missing_table"));
+
+        var ran = Assert.Single(logger.Messages, m => m.Level == LogLevel.Information);
+        Assert.Contains("query with parameters secret: SELECT @secret AS v", ran.Text);
+        Assert.Contains("1 rows", ran.Text);
+        Assert.Contains(logger.Messages, m => m.Level == LogLevel.Warning && m.Text.Contains("sqlmcp_missing_table"));
+        Assert.DoesNotContain(logger.Messages, m => m.Text.Contains("hunter2"));
+    }
+
+    private sealed class ListLogger : ILogger<QueryService>
+    {
+        public List<(LogLevel Level, string Text)> Messages { get; } = [];
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            lock (Messages)
+                Messages.Add((logLevel, formatter(state, exception)));
+        }
     }
 }

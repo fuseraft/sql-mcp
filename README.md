@@ -89,8 +89,13 @@ All settings live in `appsettings.json`.
 | `App:AuthToken` | _(none)_ | Bearer token required on `/mcp` and `/api/*`. Set it with env var `App__AuthToken` rather than in the file. Required to listen beyond localhost. |
 | `App:AllowedOrigins` | `[]` | Browser origins allowed to call the server. Requests carrying any other `Origin` header are rejected. |
 | `App:AllowUnauthenticated` | `false` | Allow listening beyond localhost without `AuthToken`, for when a proxy in front authenticates. |
-| `App:MaxRows` | `1000` | Maximum rows returned per query. Response includes `"truncated": true` when the limit is hit. |
-| `App:QueryTimeoutSeconds` | `30` | Per-query timeout in seconds. |
+| `App:MaxRows` | `1000` | Maximum rows returned per query, and tables per `list_tables`. Response includes `"truncated": true` when the limit is hit. |
+| `App:QueryTimeoutSeconds` | `30` | Per-query timeout in seconds. Also how long a query waits for a free slot when `MaxConcurrentQueries` are already running. |
+| `App:MaxValueLength` | `10000` | Longest string returned for a single value, in characters. Longer text and binary values are cut off and marked `… [truncated: N characters in total]`. |
+| `App:MaxResultBytes` | `4000000` | Approximate size limit for one query's result. Rows stop being added once it's reached, and the response says `"truncated": true`. |
+| `App:MaxConcurrentQueries` | `8` | Queries that may run at once against each database. Further queries wait up to `QueryTimeoutSeconds`, then fail with "Database 'x' is busy". |
+
+The configuration is checked at startup. An invalid limit, a duplicate or missing database name, a missing or unknown `Provider`, an unparseable connection string, or a `PasswordEnvVar` without a `{password}` placeholder stops the server with every problem listed. A database whose `PasswordEnvVar` isn't set is logged as a warning and only that database is unavailable.
 
 ### Database entries
 
@@ -98,7 +103,7 @@ Each entry under `Databases` has:
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `Name` | yes | Identifier used in API calls. |
+| `Name` | yes | Identifier used in API calls. Unique, ignoring case; agents may use any case. |
 | `Provider` | yes | One of `SqlServer`, `Postgres`, `MySql`, `Oracle`. |
 | `ConnectionString` | yes | Standard ADO.NET connection string. Use `{password}` as a placeholder if using `PasswordEnvVar`. |
 | `PasswordEnvVar` | no | Environment variable name whose value is substituted for `{password}` in the connection string. |
@@ -125,6 +130,10 @@ Example:
 ```
 
 For local development, put real connection strings in `appsettings.Development.json` (gitignored).
+
+### Logging
+
+Each tool call is logged by `SqlMcp.Services.QueryService`: the database, the SQL (or the schema lookup), the names of any parameters, how long it took and how many rows it returned. Parameter values are never logged. Failures are logged as warnings. `appsettings.Production.json` keeps this category at `Information` while everything else is at `Warning`; set it to `Warning` to log only failures. In stdio mode all logs go to stderr.
 
 ### Environment variable overrides
 
@@ -204,6 +213,14 @@ Returns the result as JSON text:
 ```json
 { "columns": ["id", "name"], "rows": [{ "id": 1, "name": "Ada" }], "truncated": false }
 ```
+
+Every column keeps its value: unnamed columns are called `column1`, `column2`, ... and repeated names get a suffix (`SELECT a.id, b.id` returns `id` and `id_2`). Values JSON can't hold are converted:
+- `NaN` and infinite floats become the strings `"NaN"`, `"Infinity"`, `"-Infinity"`.
+- Oracle `NUMBER`s beyond 28 significant digits are rounded (`1/3`), and integers too large for a decimal come back as strings.
+- Binary values are base64.
+- Types without a JSON form (Postgres `inet`, ranges, geometric types; Oracle intervals) are returned as their text.
+
+A value the driver can't read at all, such as a SQL Server `geography` column (whose .NET types aren't shipped), is replaced by a note saying so, and the rest of the result is unaffected. Select it as text instead, e.g. `geo.ToString()`.
 
 Example over Streamable HTTP (the server runs stateless, so no `initialize` handshake is needed for a one-off call):
 

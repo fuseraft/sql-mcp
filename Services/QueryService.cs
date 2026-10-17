@@ -5,6 +5,8 @@ using SqlMcp.Models;
 using System.Collections.Concurrent;
 using System.Data;
 using System.Data.Common;
+using System.Diagnostics;
+using System.Text.Json;
 
 namespace SqlMcp.Services;
 
@@ -22,19 +24,119 @@ public class QueryService
     private readonly List<DbConfig> _dbs;
     private readonly int _maxRows;
     private readonly int _queryTimeoutSeconds;
+    private readonly int _maxValueLength;
+    private readonly long _maxResultBytes;
     private readonly ILogger<QueryService> _logger;
     private readonly ConcurrentDictionary<string, (DateTime CheckedAt, IReadOnlyList<string> Findings)> _audits = new();
+    private readonly Dictionary<string, SemaphoreSlim> _slots;
 
+    /// <summary>
+    /// Reads and validates the configuration; throws InvalidOperationException listing
+    /// every problem, so a bad config stops the server at startup.
+    /// </summary>
     public QueryService(IConfiguration config, ILogger<QueryService>? logger = null)
     {
-        _dbs = config.GetSection("Databases").Get<List<DbConfig>>() ?? [];
-        _maxRows = config.GetValue("App:MaxRows", 1000);
-        _queryTimeoutSeconds = config.GetValue("App:QueryTimeoutSeconds", 30);
         _logger = logger ?? NullLogger<QueryService>.Instance;
 
+        var errors = new List<string>();
+        try
+        {
+            _dbs = config.GetSection("Databases").Get<List<DbConfig>>() ?? [];
+        }
+        catch (InvalidOperationException ex)
+        {
+            // e.g. an unknown Provider; the binder names the bad value.
+            throw new InvalidOperationException($"Invalid configuration: {ex.Message} {ex.InnerException?.Message}".Trim(), ex);
+        }
+
+        _maxRows = Positive(config, "App:MaxRows", 1000, errors);
+        _queryTimeoutSeconds = Positive(config, "App:QueryTimeoutSeconds", 30, errors);
+        _maxValueLength = Positive(config, "App:MaxValueLength", 10_000, errors);
+        _maxResultBytes = Positive(config, "App:MaxResultBytes", 4_000_000, errors);
+        int maxConcurrent = Positive(config, "App:MaxConcurrentQueries", 8, errors);
+
+        // The binder turns a missing or misspelled Provider into SqlServer, the enum's
+        // default, so check the raw values.
+        foreach (var (entry, i) in config.GetSection("Databases").GetChildren().Select((e, i) => (e, i)))
+        {
+            var provider = entry["Provider"];
+            if (!Enum.TryParse<DbProvider>(provider, ignoreCase: true, out var parsed) || !Enum.IsDefined(parsed) || int.TryParse(provider, out _))
+                errors.Add($"{(string.IsNullOrWhiteSpace(entry["Name"]) ? $"Databases:{i}" : $"Database '{entry["Name"]}'")} has " +
+                           $"{(string.IsNullOrWhiteSpace(provider) ? "no Provider" : $"unknown Provider '{provider}'")}; " +
+                           $"use one of {string.Join(", ", Enum.GetNames<DbProvider>())}.");
+        }
+
+        ValidateDatabases(errors);
+        if (errors.Count > 0)
+            throw new InvalidOperationException("Invalid configuration:" + string.Concat(errors.Select(e => $"{Environment.NewLine}  - {e}")));
+
+        _slots = _dbs.ToDictionary(d => d.Name, _ => new SemaphoreSlim(maxConcurrent, maxConcurrent));
+
+        if (_dbs.Count == 0)
+            _logger.LogWarning("No databases are configured; add entries under Databases.");
         foreach (var db in _dbs.Where(d => d.AllowWritableLogin))
             _logger.LogWarning("Database {Database} has AllowWritableLogin set; its login is not checked for write access.", db.Name);
+        foreach (var db in _dbs.Where(d => MissingPassword(d) is not null))
+            _logger.LogWarning("Database {Database} can't be queried: {Problem}", db.Name, MissingPassword(db));
     }
+
+    private static int Positive(IConfiguration config, string key, int fallback, List<string> errors)
+    {
+        int value;
+        try
+        {
+            value = config.GetValue(key, fallback);
+        }
+        catch (InvalidOperationException)
+        {
+            errors.Add($"{key} must be a whole number, not '{config[key]}'.");
+            return fallback;
+        }
+        if (value < 1)
+            errors.Add($"{key} must be at least 1, not {value}.");
+        return value;
+    }
+
+    private void ValidateDatabases(List<string> errors)
+    {
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (int i = 0; i < _dbs.Count; i++)
+        {
+            var db = _dbs[i];
+            var label = string.IsNullOrWhiteSpace(db.Name) ? $"Databases:{i}" : $"Database '{db.Name}'";
+            if (string.IsNullOrWhiteSpace(db.Name))
+                errors.Add($"{label} has no Name.");
+            else if (!names.Add(db.Name))
+                errors.Add($"{label} is configured more than once (names are compared ignoring case).");
+
+            if (string.IsNullOrWhiteSpace(db.ConnectionString))
+            {
+                errors.Add($"{label} has no ConnectionString.");
+                continue;
+            }
+
+            try
+            {
+                var builder = db.GetFactory().CreateConnectionStringBuilder()!;
+                builder.ConnectionString = db.ConnectionString;
+            }
+            catch (Exception ex)
+            {
+                errors.Add($"{label} has an invalid {db.Provider} ConnectionString: {ex.Message}");
+            }
+
+            if (!string.IsNullOrEmpty(db.PasswordEnvVar) && !db.ConnectionString.Contains("{password}", StringComparison.OrdinalIgnoreCase))
+                errors.Add($"{label} sets PasswordEnvVar but its ConnectionString has no {{password}} placeholder.");
+        }
+    }
+
+    /// <summary>
+    /// A missing password variable disables only its own database, so the others stay up.
+    /// </summary>
+    private static string? MissingPassword(DbConfig db) =>
+        !string.IsNullOrEmpty(db.PasswordEnvVar) && string.IsNullOrEmpty(Environment.GetEnvironmentVariable(db.PasswordEnvVar))
+            ? $"environment variable {db.PasswordEnvVar}, which holds its password, is not set."
+            : null;
 
     public async Task<Result<QueryResult, string>> ExecuteAsync(QueryRequest req, CancellationToken ct = default)
     {
@@ -53,7 +155,10 @@ public class QueryService
         if (parameterError is not null)
             return new(null!, parameterError);
 
-        return await RunAsync(db, async newCommand =>
+        var operation = parameters.Count == 0
+            ? $"query: {verdict.Sql}"
+            : $"query with parameters {string.Join(", ", parameters.Select(p => p.Key))}: {verdict.Sql}";
+        return await RunAsync(db, operation, async newCommand =>
         {
             await using var cmd = newCommand();
             cmd.CommandText = verdict.Sql;
@@ -72,7 +177,7 @@ public class QueryService
         if (db == null)
             return new(null!, UnknownDatabase(dbName));
 
-        return await RunAsync(db, async newCommand =>
+        return await RunAsync(db, schema is null ? "list_tables" : $"list_tables in {schema}", async newCommand =>
         {
             var tables = await SchemaCatalog.FindTablesAsync(newCommand, db.Provider, NullIfBlank(schema), null, _maxRows, ct);
             return tables.Count > _maxRows
@@ -101,7 +206,7 @@ public class QueryService
             (schema, table) = (table[..dot], table[(dot + 1)..]);
 
         string? notFound = null;
-        var result = await RunAsync(db, async newCommand =>
+        var result = await RunAsync(db, $"describe_table {(schema is null ? table : $"{schema}.{table}")}", async newCommand =>
         {
             var matches = await SchemaCatalog.FindTablesAsync(newCommand, db.Provider, schema, table, 50, ct);
 
@@ -130,7 +235,54 @@ public class QueryService
     /// Connects, checks the login, and runs work inside a read-only transaction that is
     /// always rolled back. Commands from newCommand are bound to that transaction.
     /// </summary>
-    private async Task<Result<T, string>> RunAsync<T>(DbConfig db, Func<Func<DbCommand>, Task<T>> work, CancellationToken ct)
+    private async Task<Result<T, string>> RunAsync<T>(DbConfig db, string operation, Func<Func<DbCommand>, Task<T>> work, CancellationToken ct)
+    {
+        if (MissingPassword(db) is { } missing)
+            return new(default, $"Database '{db.Name}' is unavailable: {missing}");
+
+        // Bounds the connections one busy agent can hold open against a database. Callers
+        // wait up to the query timeout for a free slot.
+        var slot = _slots[db.Name];
+        if (!await slot.WaitAsync(TimeSpan.FromSeconds(_queryTimeoutSeconds), ct))
+        {
+            _logger.LogWarning("Rejected {Operation} on {Database}: all query slots stayed busy for {Seconds} s.", operation, db.Name, _queryTimeoutSeconds);
+            return new(default, $"Database '{db.Name}' is busy: too many queries are already running. Try again shortly.");
+        }
+
+        var started = Stopwatch.GetTimestamp();
+        try
+        {
+            var result = await RunWithRetryAsync(db, work, ct);
+            var elapsed = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+            if (result.IsError)
+                _logger.LogWarning("Failed {Operation} on {Database} after {ElapsedMs:F0} ms: {Error}", operation, db.Name, elapsed, result.Error);
+            else
+                _logger.LogInformation("Ran {Operation} on {Database} in {ElapsedMs:F0} ms, {Rows} rows{Truncated}.",
+                    operation, db.Name, elapsed, CountRows(result.Value), IsTruncated(result.Value) ? " (truncated)" : "");
+            return result;
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogInformation("Cancelled {Operation} on {Database} after {ElapsedMs:F0} ms.", operation, db.Name, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+            throw;
+        }
+        finally
+        {
+            slot.Release();
+        }
+    }
+
+    private static int CountRows(object? value) => value switch
+    {
+        QueryResult q => q.Rows.Length,
+        TableList t => t.Tables.Length,
+        TableDescription d => d.Columns.Length,
+        _ => 0
+    };
+
+    private static bool IsTruncated(object? value) => value is QueryResult { Truncated: true } or TableList { Truncated: true };
+
+    private async Task<Result<T, string>> RunWithRetryAsync<T>(DbConfig db, Func<Func<DbCommand>, Task<T>> work, CancellationToken ct)
     {
         for (int attempt = 0; ; attempt++)
         {
@@ -180,7 +332,8 @@ public class QueryService
         }
     }
 
-    private DbConfig? FindDatabase(string? name) => _dbs.FirstOrDefault(d => d.Name == name);
+    private DbConfig? FindDatabase(string? name) =>
+        _dbs.FirstOrDefault(d => d.Name == name) ?? _dbs.FirstOrDefault(d => string.Equals(d.Name, name, StringComparison.OrdinalIgnoreCase));
 
     private static string UnknownDatabase(string? name) =>
         $"Unknown database '{name}'. Call list_databases to see available names.";
@@ -214,13 +367,13 @@ public class QueryService
     private async Task<QueryResult> ReadResultAsync(DbCommand cmd, CancellationToken ct)
     {
         await using var reader = await cmd.ExecuteReaderAsync(ct);
+        ResultValues.Prepare(reader);
 
-        var columns = Enumerable.Range(0, reader.FieldCount)
-            .Select(reader.GetName)
-            .ToArray();
+        var columns = UniqueColumnNames(Enumerable.Range(0, reader.FieldCount).Select(reader.GetName));
 
         var rows = new List<Dictionary<string, object?>>();
         var truncated = false;
+        long size = columns.Sum(c => c.Length + 4L);
         while (await reader.ReadAsync(ct))
         {
             if (rows.Count == _maxRows)
@@ -229,14 +382,72 @@ public class QueryService
                 break;
             }
 
-            var row = new Dictionary<string, object?>();
+            var row = new Dictionary<string, object?>(columns.Length);
+            long rowSize = 2;
             for (int i = 0; i < columns.Length; i++)
-                row[columns[i]] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+            {
+                var value = LimitLength(ResultValues.Read(reader, i));
+                row[columns[i]] = value;
+                rowSize += columns[i].Length + 4 + EstimateSize(value);
+            }
+
+            // Stop before the response outgrows App:MaxResultBytes; the first row is
+            // always returned, since its values are already capped.
+            if (rows.Count > 0 && size + rowSize > _maxResultBytes)
+            {
+                truncated = true;
+                break;
+            }
+            size += rowSize;
             rows.Add(row);
         }
 
         return new QueryResult(columns, [.. rows], truncated);
     }
+
+    /// <summary>
+    /// Rows are keyed by column name, so "SELECT 1, 2" or "SELECT a.id, b.id" would
+    /// otherwise lose all but one value. Unnamed columns become column1, column2, ...
+    /// and repeats get a suffix: id, id_2.
+    /// </summary>
+    public static string[] UniqueColumnNames(IEnumerable<string?> names)
+    {
+        var given = names.Select((n, i) => string.IsNullOrWhiteSpace(n) || n == "?column?" ? $"column{i + 1}" : n).ToArray();
+        var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new string[given.Length];
+        for (int i = 0; i < given.Length; i++)
+        {
+            var name = given[i];
+            for (int n = 2; !used.Add(name); n++)
+                name = $"{given[i]}_{n}";
+            result[i] = name;
+        }
+        return result;
+    }
+
+    /// <summary>Caps long strings and binary values at App:MaxValueLength characters.</summary>
+    private object? LimitLength(object? value)
+    {
+        switch (value)
+        {
+            case string s when s.Length > _maxValueLength:
+                return $"{s[.._maxValueLength]}… [truncated: {s.Length} characters in total]";
+            case byte[] b when (b.Length + 2) / 3 * 4 > _maxValueLength:
+                var keep = _maxValueLength / 4 * 3;
+                return $"{Convert.ToBase64String(b, 0, keep)}… [truncated: {b.Length} bytes in total, base64]";
+            default:
+                return value;
+        }
+    }
+
+    private static long EstimateSize(object? value) => value switch
+    {
+        null => 4,
+        string s => s.Length + 2,
+        byte[] b => (b.Length + 2) / 3 * 4 + 2,
+        System.Collections.IEnumerable => JsonSerializer.Serialize(value).Length,
+        _ => 24
+    };
 
     /// <summary>
     /// Opens a transaction the database itself refuses to write in, where the provider

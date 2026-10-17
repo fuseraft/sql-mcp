@@ -22,7 +22,9 @@ if (args.Contains("--stdio"))
         .WithStdioServerTransport()
         .WithToolsFromAssembly();
 
-    await builder.Build().RunAsync();
+    var host = builder.Build();
+    ExitOnInvalidConfig(() => host.Services.GetRequiredService<QueryService>());
+    await host.RunAsync();
 }
 else
 {
@@ -42,7 +44,11 @@ else
 
     var app = builder.Build();
 
-    HttpSecurity.ValidateStartup(app.Configuration);
+    ExitOnInvalidConfig(() =>
+    {
+        HttpSecurity.ValidateStartup(app.Configuration);
+        app.Services.GetRequiredService<QueryService>();
+    });
     app.UseHttpSecurity();
 
     app.MapMcp("/mcp");
@@ -59,6 +65,21 @@ else
 
     var urls = app.Configuration["App:Urls"] ?? HttpSecurity.DefaultUrls;
     await app.RunAsync(urls);
+}
+
+// Resolving QueryService validates the config, so a bad one stops the server before it
+// serves anything, with the problems listed and no stack trace.
+static void ExitOnInvalidConfig(Action validate)
+{
+    try
+    {
+        validate();
+    }
+    catch (InvalidOperationException ex)
+    {
+        Console.Error.WriteLine(ex.Message);
+        Environment.Exit(1);
+    }
 }
 
 // Visible to WebApplicationFactory in the tests.
