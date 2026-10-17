@@ -235,7 +235,7 @@ public class QueryService
     /// Connects, checks the login, and runs work inside a read-only transaction that is
     /// always rolled back. Commands from newCommand are bound to that transaction.
     /// </summary>
-    private async Task<Result<T, string>> RunAsync<T>(DbConfig db, string operation, Func<Func<DbCommand>, Task<T>> work, CancellationToken ct)
+    private async Task<Result<T, string>> RunAsync<T>(DbConfig db, string operation, Func<Func<DbCommand>, Task<T>> work, CancellationToken ct, bool log = true)
     {
         if (MissingPassword(db) is { } missing)
             return new(default, $"Database '{db.Name}' is unavailable: {missing}");
@@ -254,6 +254,8 @@ public class QueryService
         {
             var result = await RunWithRetryAsync(db, work, ct);
             var elapsed = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+            if (!log)
+                return result;
             if (result.IsError)
                 _logger.LogWarning("Failed {Operation} on {Database} after {ElapsedMs:F0} ms: {Error}", operation, db.Name, elapsed, result.Error);
             else
@@ -363,6 +365,20 @@ public class QueryService
     }
 
     public string[] ListDatabases() => [.. _dbs.Select(d => d.Name)];
+
+    /// <summary>
+    /// Connects to every database, runs the login audit and opens the read-only
+    /// transaction, without running a query. Returns "ok" or the error for each.
+    /// </summary>
+    public async Task<Dictionary<string, string>> CheckDatabasesAsync(CancellationToken ct = default)
+    {
+        var checks = _dbs.Select(async db =>
+        {
+            var result = await RunAsync(db, "readiness check", _ => Task.FromResult(true), ct, log: false);
+            return (db.Name, Status: result.Error ?? "ok");
+        });
+        return (await Task.WhenAll(checks)).ToDictionary(c => c.Name, c => c.Status);
+    }
 
     private async Task<QueryResult> ReadResultAsync(DbCommand cmd, CancellationToken ct)
     {
