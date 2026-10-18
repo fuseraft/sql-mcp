@@ -141,6 +141,7 @@ public class HttpSecurityTests
         var logs = new LogCollector();
         var client = Client(token: "s3cret", logs: logs);
 
+        await client.SendAsync(McpRequest(bearer: "s3cret"));
         await client.SendAsync(McpRequest(bearer: "s3cret", body: DeleteCall));
         await client.SendAsync(new HttpRequestMessage(HttpMethod.Post, "/api/query")
         {
@@ -152,6 +153,7 @@ public class HttpSecurityTests
         Assert.Equal(LogLevel.Warning, refused.Level);
         Assert.Contains("Refused query: DELETE FROM orders on samplePostgres for reporting:", refused.Text);
         Assert.Contains(logs.Messages, m => m.Text.Contains("Refused query: SELECT 1 on nope for billing:"));
+        Assert.Contains(logs.Messages, m => m.Text == "Listed 4 databases for reporting.");
     }
 
     [Fact]

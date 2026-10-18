@@ -19,7 +19,8 @@ public sealed class SqlTools(QueryService svc)
 
     [McpServerTool(Name = "list_databases", ReadOnly = true, Idempotent = true)]
     [Description("List the names of the databases this server can query.")]
-    public string ListDatabases() => JsonSerializer.Serialize(svc.ListDatabases(), JsonOptions);
+    public string ListDatabases(RequestContext<CallToolRequestParams> context) =>
+        JsonSerializer.Serialize(svc.ListDatabases(Agent(context)), JsonOptions);
 
     [McpServerTool(Name = "list_tables", ReadOnly = true, Idempotent = true)]
     [Description("List the tables and views the database login can read, as JSON. System schemas are left out unless named.")]

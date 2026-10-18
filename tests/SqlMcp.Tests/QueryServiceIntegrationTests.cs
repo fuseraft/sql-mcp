@@ -534,10 +534,15 @@ public class QueryServiceIntegrationTests
     {
         var db = RequireDb(provider);
 
-        var result = await Service(db).DescribeTableAsync("test", "sqlmcp_no_such_table", null);
+        var logger = new ListLogger();
+
+        var result = await Service(db, logger: logger).DescribeTableAsync("test", "sqlmcp_no_such_table", null, agent: "reporting");
 
         Assert.NotNull(result.Error);
         Assert.Contains("list_tables", result.Error);
+        var failed = Assert.Single(logger.Messages, m => m.Text.Contains("describe_table sqlmcp_no_such_table"));
+        Assert.Equal(LogLevel.Warning, failed.Level);
+        Assert.StartsWith("Failed describe_table sqlmcp_no_such_table on test for reporting", failed.Text);
     }
 
     [SkippableTheory]

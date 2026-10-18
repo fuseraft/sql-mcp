@@ -133,7 +133,7 @@ For local development, put real connection strings in `appsettings.Development.j
 
 ### Logging
 
-Each tool call and `/api/query` request is logged by `SqlMcp.Services.QueryService`: the agent, the database, the SQL (or the schema lookup), the names of any parameters, how long it took and how many rows it returned. Parameter values are never logged.
+Each tool call and `/api/query` request is logged by `SqlMcp.Services.QueryService`: the agent, the database, the SQL (or the schema lookup), the names of any parameters, how long it took and how many rows it returned (for `list_databases`, the agent and how many databases there are). Parameter values are never logged.
 
 ```
 2026-10-18T14:02:11.384Z info: SqlMcp.Services.QueryService[0]
@@ -142,7 +142,7 @@ Each tool call and `/api/query` request is logged by `SqlMcp.Services.QueryServi
       Refused query: DELETE FROM orders on prod for reporting: Only SELECT queries (including CTEs) are permitted.
 ```
 
-The agent is the name its token has in `App:AgentTokens`. Over stdio, or over HTTP without agent tokens, it is `unauthenticated`. Calls refused before they reach the database (an unknown database, a statement that isn't a read, invalid parameters) are logged as warnings with the SQL, so the log shows what each agent tried as well as what ran. Failures are warnings too. A request with a missing or unknown token is logged as a warning by `SqlMcp.Http.HttpSecurity`, with its path and remote address but not the token.
+The agent is the name its token has in `App:AgentTokens`. Over stdio, or over HTTP without agent tokens, it is `unauthenticated`. Calls refused before they reach the database (an unknown database, a statement that isn't a read, invalid parameters) are logged as warnings with the SQL, so the log shows what each agent tried as well as what ran. Failures are warnings too, including a `describe_table` for a table that doesn't exist or matches more than one. A request with a missing or unknown token is logged as a warning by `SqlMcp.Http.HttpSecurity`, with its path and remote address but not the token.
 
 `appsettings.Production.json` keeps `QueryService` at `Information` while everything else is at `Warning`; set it to `Warning` to log only refusals and failures. It also starts each entry with the UTC time; under systemd, journald records the time instead. In stdio mode all logs go to stderr.
 

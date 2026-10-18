@@ -169,7 +169,7 @@ public class QueryService
             cmd.CommandText = verdict.Sql;
             foreach (var (name, value) in parameters)
                 QueryParameters.Add(cmd, db.Provider, name, value);
-            return await ReadResultAsync(cmd, ct);
+            return Ok(await ReadResultAsync(cmd, ct));
         }, ct);
     }
 
@@ -186,9 +186,9 @@ public class QueryService
         return await RunAsync(db, operation, agent, async newCommand =>
         {
             var tables = await SchemaCatalog.FindTablesAsync(newCommand, db.Provider, NullIfBlank(schema), null, _maxRows, ct);
-            return tables.Count > _maxRows
+            return Ok(tables.Count > _maxRows
                 ? new TableList([.. tables.Take(_maxRows)], Truncated: true)
-                : new TableList([.. tables]);
+                : new TableList([.. tables]));
         }, ct);
     }
 
@@ -211,8 +211,7 @@ public class QueryService
         if (schema is null && dot > 0 && dot < table.Length - 1)
             (schema, table) = (table[..dot], table[(dot + 1)..]);
 
-        string? notFound = null;
-        var result = await RunAsync(db, $"describe_table {(schema is null ? table : $"{schema}.{table}")}", agent, async newCommand =>
+        return await RunAsync(db, $"describe_table {(schema is null ? table : $"{schema}.{table}")}", agent, async newCommand =>
         {
             var matches = await SchemaCatalog.FindTablesAsync(newCommand, db.Provider, schema, table, 50, ct);
 
@@ -223,25 +222,24 @@ public class QueryService
             if (matches.Count != 1)
             {
                 var name = schema is null ? table : $"{schema}.{table}";
-                notFound = matches.Count == 0
+                return new Result<TableDescription, string>(null, matches.Count == 0
                     ? $"Table '{name}' was not found in database '{db.Name}', or the login can't read it. Call list_tables to see what it can read."
-                    : $"'{name}' matches more than one table: {string.Join(", ", matches.Select(m => $"{m.Schema}.{m.Name}"))}. Pass schema to choose one.";
-                return null!;
+                    : $"'{name}' matches more than one table: {string.Join(", ", matches.Select(m => $"{m.Schema}.{m.Name}"))}. Pass schema to choose one.");
             }
 
             var match = matches[0];
             var columns = await SchemaCatalog.GetColumnsAsync(newCommand, db.Provider, match, ct);
-            return new TableDescription(match.Schema, match.Name, match.Type, columns);
+            return Ok(new TableDescription(match.Schema, match.Name, match.Type, columns));
         }, ct);
-
-        return notFound is null ? result : new(null!, notFound);
     }
 
     /// <summary>
     /// Connects, checks the login, and runs work inside a read-only transaction that is
-    /// always rolled back. Commands from newCommand are bound to that transaction.
+    /// always rolled back. Commands from newCommand are bound to that transaction. work
+    /// returns an error for an outcome that isn't a database error but still failed, such
+    /// as a table that wasn't found, so it's logged as a failure.
     /// </summary>
-    private async Task<Result<T, string>> RunAsync<T>(DbConfig db, string operation, string? agent, Func<Func<DbCommand>, Task<T>> work, CancellationToken ct, bool log = true)
+    private async Task<Result<T, string>> RunAsync<T>(DbConfig db, string operation, string? agent, Func<Func<DbCommand>, Task<Result<T, string>>> work, CancellationToken ct, bool log = true)
     {
         if (MissingPassword(db) is { } missing)
         {
@@ -295,6 +293,8 @@ public class QueryService
 
     private static string Who(string? agent) => agent ?? "unauthenticated";
 
+    private static Result<T, string> Ok<T>(T value) => new(value, null);
+
     private static int CountRows(object? value) => value switch
     {
         QueryResult q => q.Rows.Length,
@@ -305,7 +305,7 @@ public class QueryService
 
     private static bool IsTruncated(object? value) => value is QueryResult { Truncated: true } or TableList { Truncated: true };
 
-    private async Task<Result<T, string>> RunWithRetryAsync<T>(DbConfig db, Func<Func<DbCommand>, Task<T>> work, CancellationToken ct)
+    private async Task<Result<T, string>> RunWithRetryAsync<T>(DbConfig db, Func<Func<DbCommand>, Task<Result<T, string>>> work, CancellationToken ct)
     {
         for (int attempt = 0; ; attempt++)
         {
@@ -344,7 +344,7 @@ public class QueryService
         _ => false,
     };
 
-    private async Task<Result<T, string>> RunOnceAsync<T>(DbConfig db, Func<Func<DbCommand>, Task<T>> work, CancellationToken ct)
+    private async Task<Result<T, string>> RunOnceAsync<T>(DbConfig db, Func<Func<DbCommand>, Task<Result<T, string>>> work, CancellationToken ct)
     {
         await using var conn = db.GetFactory().CreateConnection()!;
         conn.ConnectionString = ResolveConnectionString(db);
@@ -356,13 +356,13 @@ public class QueryService
         await using var tx = await BeginReadOnlyTransactionAsync(conn, db.Provider, ct);
         try
         {
-            return new(await work(() =>
+            return await work(() =>
             {
                 var cmd = conn.CreateCommand();
                 cmd.Transaction = tx;
                 cmd.CommandTimeout = _queryTimeoutSeconds;
                 return cmd;
-            }), null!);
+            });
         }
         finally
         {
@@ -401,7 +401,11 @@ public class QueryService
         return audit.Findings.Count == 0;
     }
 
-    public string[] ListDatabases() => [.. _dbs.Select(d => d.Name)];
+    public string[] ListDatabases(string? agent = null)
+    {
+        _logger.LogInformation("Listed {Count} databases for {Agent}.", _dbs.Count, Who(agent));
+        return [.. _dbs.Select(d => d.Name)];
+    }
 
     /// <summary>
     /// Connects to every database, runs the login audit and opens the read-only
@@ -411,7 +415,7 @@ public class QueryService
     {
         var checks = _dbs.Select(async db =>
         {
-            var result = await RunAsync(db, "readiness check", null, _ => Task.FromResult(true), ct, log: false);
+            var result = await RunAsync(db, "readiness check", null, _ => Task.FromResult(Ok(true)), ct, log: false);
             return (db.Name, Status: result.Error ?? "ok");
         });
         return (await Task.WhenAll(checks)).ToDictionary(c => c.Name, c => c.Status);
