@@ -77,9 +77,9 @@ else
             statusCode: ready ? StatusCodes.Status200OK : StatusCodes.Status503ServiceUnavailable);
     });
 
-    app.MapPost("/api/query", async (QueryService svc, QueryRequest req, CancellationToken ct) =>
+    app.MapPost("/api/query", async (QueryService svc, QueryRequest req, HttpContext context, CancellationToken ct) =>
     {
-        var result = await svc.ExecuteAsync(req, ct);
+        var result = await svc.ExecuteAsync(req, context.User.Identity?.Name, ct);
         if (result.IsError)
             return Results.Problem(result.Error);
         return Results.Ok(result.Value);

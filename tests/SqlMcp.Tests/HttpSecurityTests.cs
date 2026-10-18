@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using SqlMcp.Http;
 using System.Net;
 using System.Net.Http.Headers;
@@ -47,31 +48,53 @@ public class HttpSecurityTests
     }
 
     [Fact]
-    public void Starts_on_all_interfaces_with_a_token_or_an_explicit_opt_out()
+    public void Starts_on_all_interfaces_with_agent_tokens_or_an_explicit_opt_out()
     {
-        HttpSecurity.ValidateStartup(Config(("App:Urls", "http://*:8080"), ("App:AuthToken", "secret")));
+        HttpSecurity.ValidateStartup(Config(("App:Urls", "http://*:8080"), ("App:AgentTokens:reporting", "secret")));
         HttpSecurity.ValidateStartup(Config(("App:Urls", "http://*:8080"), ("App:AllowUnauthenticated", "true")));
+    }
+
+    [Fact]
+    public void Refuses_blank_and_shared_agent_tokens()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() => HttpSecurity.ValidateStartup(Config(
+            ("App:AgentTokens:blank", ""),
+            ("App:AgentTokens:reporting", "same"),
+            ("App:AgentTokens:billing", "same"),
+            ("App:AgentTokens:support", "other"))));
+
+        Assert.Contains("Agent 'blank' has no token", ex.Message);
+        Assert.Contains("'reporting'", ex.Message);
+        Assert.Contains("'billing'", ex.Message);
+        Assert.Contains("share a token", ex.Message);
+        Assert.DoesNotContain("'support'", ex.Message);
     }
 
     private const string ListDatabasesCall =
         """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_databases","arguments":{}}}""";
 
-    private static HttpClient Client(string? token = null, string[]? allowedOrigins = null)
+    private static HttpClient Client(string? token = null, string[]? allowedOrigins = null, LogCollector? logs = null)
     {
         var factory = new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
         {
-            b.UseSetting("App:AuthToken", token ?? "");
+            if (token is not null)
+            {
+                b.UseSetting("App:AgentTokens:reporting", token);
+                b.UseSetting("App:AgentTokens:billing", token + "-billing");
+            }
             for (int i = 0; i < (allowedOrigins?.Length ?? 0); i++)
                 b.UseSetting($"App:AllowedOrigins:{i}", allowedOrigins![i]);
+            if (logs is not null)
+                b.ConfigureLogging(l => l.AddProvider(logs));
         });
         return factory.CreateClient();
     }
 
-    private static HttpRequestMessage McpRequest(string? bearer = null, string? origin = null)
+    private static HttpRequestMessage McpRequest(string? bearer = null, string? origin = null, string body = ListDatabasesCall)
     {
         var request = new HttpRequestMessage(HttpMethod.Post, "/mcp")
         {
-            Content = new StringContent(ListDatabasesCall, Encoding.UTF8, "application/json")
+            Content = new StringContent(body, Encoding.UTF8, "application/json")
         };
         request.Headers.Accept.ParseAdd("application/json");
         request.Headers.Accept.ParseAdd("text/event-stream");
@@ -104,6 +127,56 @@ public class HttpSecurityTests
         var right = await client.SendAsync(McpRequest(bearer: "s3cret"));
         Assert.Equal(HttpStatusCode.OK, right.StatusCode);
         Assert.Contains("samplePostgres", await right.Content.ReadAsStringAsync());
+
+        var otherAgent = await client.SendAsync(McpRequest(bearer: "s3cret-billing"));
+        Assert.Equal(HttpStatusCode.OK, otherAgent.StatusCode);
+    }
+
+    private const string DeleteCall =
+        """{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query_database","arguments":{"dbName":"samplePostgres","sql":"DELETE FROM orders"}}}""";
+
+    [Fact]
+    public async Task Logs_each_call_under_the_agent_whose_token_it_carries()
+    {
+        var logs = new LogCollector();
+        var client = Client(token: "s3cret", logs: logs);
+
+        await client.SendAsync(McpRequest(bearer: "s3cret"));
+        await client.SendAsync(McpRequest(bearer: "s3cret", body: DeleteCall));
+        await client.SendAsync(new HttpRequestMessage(HttpMethod.Post, "/api/query")
+        {
+            Content = new StringContent("""{"dbName":"nope","sql":"SELECT 1"}""", Encoding.UTF8, "application/json"),
+            Headers = { Authorization = new AuthenticationHeaderValue("Bearer", "s3cret-billing") }
+        });
+
+        var refused = Assert.Single(logs.Messages, m => m.Text.Contains("DELETE FROM orders"));
+        Assert.Equal(LogLevel.Warning, refused.Level);
+        Assert.Contains("Refused query: DELETE FROM orders on samplePostgres for reporting:", refused.Text);
+        Assert.Contains(logs.Messages, m => m.Text.Contains("Refused query: SELECT 1 on nope for billing:"));
+        Assert.Contains(logs.Messages, m => m.Text == "Listed 4 databases for reporting.");
+    }
+
+    [Fact]
+    public async Task Without_tokens_calls_are_logged_as_unauthenticated()
+    {
+        var logs = new LogCollector();
+
+        await Client(logs: logs).SendAsync(McpRequest(body: DeleteCall));
+
+        Assert.Contains(logs.Messages, m => m.Text.Contains("on samplePostgres for unauthenticated:"));
+    }
+
+    [Fact]
+    public async Task Logs_requests_rejected_for_their_token()
+    {
+        var logs = new LogCollector();
+
+        await Client(token: "s3cret", logs: logs).SendAsync(McpRequest(bearer: "guess"));
+
+        var rejected = Assert.Single(logs.Messages, m => m.Text.StartsWith("Rejected POST /mcp"));
+        Assert.Equal(LogLevel.Warning, rejected.Level);
+        Assert.Contains("missing or unknown bearer token", rejected.Text);
+        Assert.DoesNotContain(logs.Messages, m => m.Text.Contains("guess"));
     }
 
     [Fact]
@@ -131,5 +204,19 @@ public class HttpSecurityTests
     {
         var response = await Client(allowedOrigins: ["https://app.example"]).SendAsync(McpRequest(origin: "https://app.example"));
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    internal sealed class LogCollector : ILoggerProvider, ILogger
+    {
+        public List<(LogLevel Level, string Text)> Messages { get; } = [];
+        public ILogger CreateLogger(string categoryName) => this;
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            lock (Messages)
+                Messages.Add((logLevel, formatter(state, exception)));
+        }
+        public void Dispose() { }
     }
 }

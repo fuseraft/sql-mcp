@@ -65,7 +65,7 @@ Streamable HTTP:
     "sql": {
       "type": "http",
       "url": "http://localhost:8080/mcp",
-      "headers": { "Authorization": "Bearer <App:AuthToken>" }
+      "headers": { "Authorization": "Bearer <the agent's token from App:AgentTokens>" }
     }
   }
 }
@@ -86,9 +86,9 @@ All settings live in `appsettings.json`.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `App:Urls` | `http://localhost:8080` | Bind address(es), `;`-separated. Override with env var `App__Urls`. |
-| `App:AuthToken` | _(none)_ | Bearer token required on `/mcp` and `/api/*`. Set it with env var `App__AuthToken` rather than in the file. Required to listen beyond localhost. |
+| `App:AgentTokens` | `{}` | Each agent's name and the bearer token it sends on `/mcp` and `/api/*`, e.g. `{"reporting": "<token>"}`. Calls are logged under the agent's name (see [Logging](#logging)). Set tokens with env vars such as `App__AgentTokens__reporting` rather than in the file, and keep names to letters, digits and underscores so they work as variable names everywhere. A blank token, or one shared by two agents, stops the server at startup. Required to listen beyond localhost. |
 | `App:AllowedOrigins` | `[]` | Browser origins allowed to call the server. Requests carrying any other `Origin` header are rejected. |
-| `App:AllowUnauthenticated` | `false` | Allow listening beyond localhost without `AuthToken`, for when a proxy in front authenticates. |
+| `App:AllowUnauthenticated` | `false` | Allow listening beyond localhost without `AgentTokens`, for when a proxy in front authenticates. |
 | `App:MaxRows` | `1000` | Maximum rows returned per query, and tables per `list_tables`. Response includes `"truncated": true` when the limit is hit. |
 | `App:QueryTimeoutSeconds` | `30` | Per-query timeout in seconds; a query that runs longer fails with "Query timed out after N s". Also how long a query waits for a free slot when `MaxConcurrentQueries` are already running. |
 | `App:MaxValueLength` | `10000` | Longest string returned for a single value, in characters. Longer text and binary values are cut off and marked `… [truncated: N characters in total]`. |
@@ -133,7 +133,18 @@ For local development, put real connection strings in `appsettings.Development.j
 
 ### Logging
 
-Each tool call is logged by `SqlMcp.Services.QueryService`: the database, the SQL (or the schema lookup), the names of any parameters, how long it took and how many rows it returned. Parameter values are never logged. Failures are logged as warnings. `appsettings.Production.json` keeps this category at `Information` while everything else is at `Warning`; set it to `Warning` to log only failures. In stdio mode all logs go to stderr.
+Each tool call and `/api/query` request is logged by `SqlMcp.Services.QueryService`: the agent, the database, the SQL (or the schema lookup), the names of any parameters, how long it took and how many rows it returned (for `list_databases`, the agent and how many databases there are). Parameter values are never logged.
+
+```
+2026-10-18T14:02:11.384Z info: SqlMcp.Services.QueryService[0]
+      Ran query: SELECT id FROM orders on prod for reporting in 12 ms, 3 rows.
+2026-10-18T14:02:40.019Z warn: SqlMcp.Services.QueryService[0]
+      Refused query: DELETE FROM orders on prod for reporting: Only SELECT queries (including CTEs) are permitted.
+```
+
+The agent is the name its token has in `App:AgentTokens`. Over stdio, or over HTTP without agent tokens, it is `unauthenticated`. Calls refused before they reach the database (an unknown database, a statement that isn't a read, invalid parameters) are logged as warnings with the SQL, so the log shows what each agent tried as well as what ran. Failures are warnings too, including a `describe_table` for a table that doesn't exist or matches more than one. A request with a missing or unknown token is logged as a warning by `SqlMcp.Http.HttpSecurity`, with its path and remote address but not the token.
+
+`appsettings.Production.json` keeps `QueryService` at `Information` while everything else is at `Warning`; set it to `Warning` to log only refusals and failures. It also starts each entry with the UTC time; under systemd, journald records the time instead. In stdio mode all logs go to stderr.
 
 ### Environment variable overrides
 
@@ -249,7 +260,7 @@ curl -s http://localhost:8080/mcp \
 { "status": "unavailable", "databases": { "prod": "ok", "reporting": "Database 'reporting' is disabled because its login can modify data. The server log lists why." } }
 ```
 
-It requires the bearer token when `App:AuthToken` is set, since it names the databases. Readiness checks aren't written to the query log.
+It requires an agent's token when `App:AgentTokens` is set, since it names the databases. Readiness checks aren't written to the query log.
 
 ---
 
@@ -287,7 +298,7 @@ Queries come from AI agents, so every query passes three layers before anything 
 
 **What agents can still do:** read anything the login can read. Grant `SELECT` only on what agents should see. Two cases fall outside the audit: grants made after a passing audit (noticed within five minutes), and on SQL Server, CLR functions created with `EXTERNAL_ACCESS` or `UNSAFE` that the login can call.
 
-**HTTP transport.** By default the server listens on `localhost` only. To listen beyond it, set `App:AuthToken`: clients then send `Authorization: Bearer <token>` on `/mcp` and `/api/*` (`/health` stays open for probes). The server refuses to start on a non-loopback address without a token unless `App:AllowUnauthenticated` is `true`. Requests that carry an `Origin` header not listed in `App:AllowedOrigins` are rejected, so a web page can't reach a local server through DNS rebinding. The stdio transport is only reachable by the process that launched it.
+**HTTP transport.** By default the server listens on `localhost` only. To listen beyond it, give each agent its own token under `App:AgentTokens`: clients then send `Authorization: Bearer <token>` on `/mcp` and `/api/*` (`/health` stays open for probes), and their calls are logged under the agent's name. Revoking an agent means removing its entry and restarting. The server refuses to start on a non-loopback address without tokens unless `App:AllowUnauthenticated` is `true`. Requests that carry an `Origin` header not listed in `App:AllowedOrigins` are rejected, so a web page can't reach a local server through DNS rebinding. The stdio transport is only reachable by the process that launched it.
 
 **Values in queries.** Agents should pass values through `parameters` (see [`query_database`](#query_database)) rather than splicing them into the SQL. Bound values can't change a query's structure, whatever quotes or keywords they contain. Statement validation still applies to the SQL text itself, and catches injected statements in SQL an agent built by concatenating strings.
 
@@ -316,13 +327,13 @@ No .NET runtime needed on the target machine.
 ```bash
 docker build -t sql-mcp .
 docker run -p 8080:8080 \
-  -e App__AuthToken="$(openssl rand -hex 32)" \
+  -e App__AgentTokens__reporting="$(openssl rand -hex 32)" \
   -e DB_PROD_PASSWORD=secret \
   -v /path/to/appsettings.json:/app/appsettings.json \
   sql-mcp
 ```
 
-The image listens on all interfaces inside the container, so it won't start without `App__AuthToken`. It runs as the base image's unprivileged `app` user (uid 1654), so a mounted `appsettings.json` must be readable by that user. Its `HEALTHCHECK` runs `dotnet sql-mcp.dll --healthcheck`, which calls `/health` on the configured port and exits 0 or 1. Use the same command for health checks anywhere curl isn't installed.
+The image listens on all interfaces inside the container, so it won't start without at least one `App__AgentTokens__<name>`. It runs as the base image's unprivileged `app` user (uid 1654), so a mounted `appsettings.json` must be readable by that user. Its `HEALTHCHECK` runs `dotnet sql-mcp.dll --healthcheck`, which calls `/health` on the configured port and exits 0 or 1. Use the same command for health checks anywhere curl isn't installed.
 
 ### Linux — systemd service
 
@@ -339,7 +350,7 @@ WorkingDirectory=/opt/sql-mcp
 Restart=always
 Environment=ASPNETCORE_ENVIRONMENT=Production
 Environment=DB_PROD_PASSWORD=secret
-Environment=App__AuthToken=<long random token>
+Environment=App__AgentTokens__reporting=<long random token>
 
 [Install]
 WantedBy=multi-user.target

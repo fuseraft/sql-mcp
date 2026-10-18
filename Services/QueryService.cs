@@ -138,51 +138,57 @@ public class QueryService
             ? $"environment variable {db.PasswordEnvVar}, which holds its password, is not set."
             : null;
 
-    public async Task<Result<QueryResult, string>> ExecuteAsync(QueryRequest req, CancellationToken ct = default)
+    /// <summary>
+    /// Runs a read-only query. agent names the caller in the log; null means it wasn't
+    /// authenticated (stdio, or HTTP without App:AgentTokens).
+    /// </summary>
+    public async Task<Result<QueryResult, string>> ExecuteAsync(QueryRequest req, string? agent = null, CancellationToken ct = default)
     {
+        var refused = $"query: {req.Sql}";
         if (string.IsNullOrWhiteSpace(req.DbName) || req.Sql is null)
-            return new(null!, "Both dbName and sql are required.");
+            return Refuse<QueryResult>(refused, req.DbName, agent, "Both dbName and sql are required.");
 
         var db = FindDatabase(req.DbName);
         if (db == null)
-            return new(null!, UnknownDatabase(req.DbName));
+            return Refuse<QueryResult>(refused, req.DbName, agent, UnknownDatabase(req.DbName));
 
         var verdict = SqlGuard.Validate(req.Sql, db.Provider);
         if (!verdict.IsAllowed)
-            return new(null!, verdict.Error!);
+            return Refuse<QueryResult>(refused, db.Name, agent, verdict.Error!);
 
         var (parameters, parameterError) = QueryParameters.Parse(req.Parameters);
         if (parameterError is not null)
-            return new(null!, parameterError);
+            return Refuse<QueryResult>(refused, db.Name, agent, parameterError);
 
         var operation = parameters.Count == 0
             ? $"query: {verdict.Sql}"
             : $"query with parameters {string.Join(", ", parameters.Select(p => p.Key))}: {verdict.Sql}";
-        return await RunAsync(db, operation, async newCommand =>
+        return await RunAsync(db, operation, agent, async newCommand =>
         {
             await using var cmd = newCommand();
             cmd.CommandText = verdict.Sql;
             foreach (var (name, value) in parameters)
                 QueryParameters.Add(cmd, db.Provider, name, value);
-            return await ReadResultAsync(cmd, ct);
+            return Ok(await ReadResultAsync(cmd, ct));
         }, ct);
     }
 
     /// <summary>
     /// Lists the tables and views the login can read, optionally in one schema.
     /// </summary>
-    public async Task<Result<TableList, string>> ListTablesAsync(string dbName, string? schema, CancellationToken ct = default)
+    public async Task<Result<TableList, string>> ListTablesAsync(string dbName, string? schema, string? agent = null, CancellationToken ct = default)
     {
+        var operation = schema is null ? "list_tables" : $"list_tables in {schema}";
         var db = FindDatabase(dbName);
         if (db == null)
-            return new(null!, UnknownDatabase(dbName));
+            return Refuse<TableList>(operation, dbName, agent, UnknownDatabase(dbName));
 
-        return await RunAsync(db, schema is null ? "list_tables" : $"list_tables in {schema}", async newCommand =>
+        return await RunAsync(db, operation, agent, async newCommand =>
         {
             var tables = await SchemaCatalog.FindTablesAsync(newCommand, db.Provider, NullIfBlank(schema), null, _maxRows, ct);
-            return tables.Count > _maxRows
+            return Ok(tables.Count > _maxRows
                 ? new TableList([.. tables.Take(_maxRows)], Truncated: true)
-                : new TableList([.. tables]);
+                : new TableList([.. tables]));
         }, ct);
     }
 
@@ -191,13 +197,13 @@ public class QueryService
     /// table is looked up across all non-system schemas, and "schema.table" is accepted.
     /// </summary>
     public async Task<Result<TableDescription, string>> DescribeTableAsync(
-        string dbName, string table, string? schema, CancellationToken ct = default)
+        string dbName, string table, string? schema, string? agent = null, CancellationToken ct = default)
     {
         var db = FindDatabase(dbName);
         if (db == null)
-            return new(null!, UnknownDatabase(dbName));
+            return Refuse<TableDescription>($"describe_table {table}", dbName, agent, UnknownDatabase(dbName));
         if (string.IsNullOrWhiteSpace(table))
-            return new(null!, "table is required.");
+            return Refuse<TableDescription>("describe_table", db.Name, agent, "table is required.");
 
         table = table.Trim();
         schema = NullIfBlank(schema);
@@ -205,8 +211,7 @@ public class QueryService
         if (schema is null && dot > 0 && dot < table.Length - 1)
             (schema, table) = (table[..dot], table[(dot + 1)..]);
 
-        string? notFound = null;
-        var result = await RunAsync(db, $"describe_table {(schema is null ? table : $"{schema}.{table}")}", async newCommand =>
+        return await RunAsync(db, $"describe_table {(schema is null ? table : $"{schema}.{table}")}", agent, async newCommand =>
         {
             var matches = await SchemaCatalog.FindTablesAsync(newCommand, db.Provider, schema, table, 50, ct);
 
@@ -217,35 +222,37 @@ public class QueryService
             if (matches.Count != 1)
             {
                 var name = schema is null ? table : $"{schema}.{table}";
-                notFound = matches.Count == 0
+                return new Result<TableDescription, string>(null, matches.Count == 0
                     ? $"Table '{name}' was not found in database '{db.Name}', or the login can't read it. Call list_tables to see what it can read."
-                    : $"'{name}' matches more than one table: {string.Join(", ", matches.Select(m => $"{m.Schema}.{m.Name}"))}. Pass schema to choose one.";
-                return null!;
+                    : $"'{name}' matches more than one table: {string.Join(", ", matches.Select(m => $"{m.Schema}.{m.Name}"))}. Pass schema to choose one.");
             }
 
             var match = matches[0];
             var columns = await SchemaCatalog.GetColumnsAsync(newCommand, db.Provider, match, ct);
-            return new TableDescription(match.Schema, match.Name, match.Type, columns);
+            return Ok(new TableDescription(match.Schema, match.Name, match.Type, columns));
         }, ct);
-
-        return notFound is null ? result : new(null!, notFound);
     }
 
     /// <summary>
     /// Connects, checks the login, and runs work inside a read-only transaction that is
-    /// always rolled back. Commands from newCommand are bound to that transaction.
+    /// always rolled back. Commands from newCommand are bound to that transaction. work
+    /// returns an error for an outcome that isn't a database error but still failed, such
+    /// as a table that wasn't found, so it's logged as a failure.
     /// </summary>
-    private async Task<Result<T, string>> RunAsync<T>(DbConfig db, string operation, Func<Func<DbCommand>, Task<T>> work, CancellationToken ct, bool log = true)
+    private async Task<Result<T, string>> RunAsync<T>(DbConfig db, string operation, string? agent, Func<Func<DbCommand>, Task<Result<T, string>>> work, CancellationToken ct, bool log = true)
     {
         if (MissingPassword(db) is { } missing)
-            return new(default, $"Database '{db.Name}' is unavailable: {missing}");
+        {
+            var unavailable = $"Database '{db.Name}' is unavailable: {missing}";
+            return log ? Refuse<T>(operation, db.Name, agent, unavailable) : new(default, unavailable);
+        }
 
         // Bounds the connections one busy agent can hold open against a database. Callers
         // wait up to the query timeout for a free slot.
         var slot = _slots[db.Name];
         if (!await slot.WaitAsync(TimeSpan.FromSeconds(_queryTimeoutSeconds), ct))
         {
-            _logger.LogWarning("Rejected {Operation} on {Database}: all query slots stayed busy for {Seconds} s.", operation, db.Name, _queryTimeoutSeconds);
+            _logger.LogWarning("Rejected {Operation} on {Database} for {Agent}: all query slots stayed busy for {Seconds} s.", operation, db.Name, Who(agent), _queryTimeoutSeconds);
             return new(default, $"Database '{db.Name}' is busy: too many queries are already running. Try again shortly.");
         }
 
@@ -257,15 +264,15 @@ public class QueryService
             if (!log)
                 return result;
             if (result.IsError)
-                _logger.LogWarning("Failed {Operation} on {Database} after {ElapsedMs:F0} ms: {Error}", operation, db.Name, elapsed, result.Error);
+                _logger.LogWarning("Failed {Operation} on {Database} for {Agent} after {ElapsedMs:F0} ms: {Error}", operation, db.Name, Who(agent), elapsed, result.Error);
             else
-                _logger.LogInformation("Ran {Operation} on {Database} in {ElapsedMs:F0} ms, {Rows} rows{Truncated}.",
-                    operation, db.Name, elapsed, CountRows(result.Value), IsTruncated(result.Value) ? " (truncated)" : "");
+                _logger.LogInformation("Ran {Operation} on {Database} for {Agent} in {ElapsedMs:F0} ms, {Rows} rows{Truncated}.",
+                    operation, db.Name, Who(agent), elapsed, CountRows(result.Value), IsTruncated(result.Value) ? " (truncated)" : "");
             return result;
         }
         catch (OperationCanceledException)
         {
-            _logger.LogInformation("Cancelled {Operation} on {Database} after {ElapsedMs:F0} ms.", operation, db.Name, Stopwatch.GetElapsedTime(started).TotalMilliseconds);
+            _logger.LogInformation("Cancelled {Operation} on {Database} for {Agent} after {ElapsedMs:F0} ms.", operation, db.Name, Who(agent), Stopwatch.GetElapsedTime(started).TotalMilliseconds);
             throw;
         }
         finally
@@ -273,6 +280,20 @@ public class QueryService
             slot.Release();
         }
     }
+
+    /// <summary>
+    /// Logs a call turned away before it reached the database, such as a statement
+    /// SqlGuard rejected, so the log shows what each agent tried as well as what ran.
+    /// </summary>
+    private Result<T, string> Refuse<T>(string operation, string? dbName, string? agent, string error)
+    {
+        _logger.LogWarning("Refused {Operation} on {Database} for {Agent}: {Error}", operation, dbName, Who(agent), error);
+        return new(default!, error);
+    }
+
+    private static string Who(string? agent) => agent ?? "unauthenticated";
+
+    private static Result<T, string> Ok<T>(T value) => new(value, null);
 
     private static int CountRows(object? value) => value switch
     {
@@ -284,7 +305,7 @@ public class QueryService
 
     private static bool IsTruncated(object? value) => value is QueryResult { Truncated: true } or TableList { Truncated: true };
 
-    private async Task<Result<T, string>> RunWithRetryAsync<T>(DbConfig db, Func<Func<DbCommand>, Task<T>> work, CancellationToken ct)
+    private async Task<Result<T, string>> RunWithRetryAsync<T>(DbConfig db, Func<Func<DbCommand>, Task<Result<T, string>>> work, CancellationToken ct)
     {
         for (int attempt = 0; ; attempt++)
         {
@@ -323,7 +344,7 @@ public class QueryService
         _ => false,
     };
 
-    private async Task<Result<T, string>> RunOnceAsync<T>(DbConfig db, Func<Func<DbCommand>, Task<T>> work, CancellationToken ct)
+    private async Task<Result<T, string>> RunOnceAsync<T>(DbConfig db, Func<Func<DbCommand>, Task<Result<T, string>>> work, CancellationToken ct)
     {
         await using var conn = db.GetFactory().CreateConnection()!;
         conn.ConnectionString = ResolveConnectionString(db);
@@ -335,13 +356,13 @@ public class QueryService
         await using var tx = await BeginReadOnlyTransactionAsync(conn, db.Provider, ct);
         try
         {
-            return new(await work(() =>
+            return await work(() =>
             {
                 var cmd = conn.CreateCommand();
                 cmd.Transaction = tx;
                 cmd.CommandTimeout = _queryTimeoutSeconds;
                 return cmd;
-            }), null!);
+            });
         }
         finally
         {
@@ -380,7 +401,11 @@ public class QueryService
         return audit.Findings.Count == 0;
     }
 
-    public string[] ListDatabases() => [.. _dbs.Select(d => d.Name)];
+    public string[] ListDatabases(string? agent = null)
+    {
+        _logger.LogInformation("Listed {Count} databases for {Agent}.", _dbs.Count, Who(agent));
+        return [.. _dbs.Select(d => d.Name)];
+    }
 
     /// <summary>
     /// Connects to every database, runs the login audit and opens the read-only
@@ -390,7 +415,7 @@ public class QueryService
     {
         var checks = _dbs.Select(async db =>
         {
-            var result = await RunAsync(db, "readiness check", _ => Task.FromResult(true), ct, log: false);
+            var result = await RunAsync(db, "readiness check", null, _ => Task.FromResult(Ok(true)), ct, log: false);
             return (db.Name, Status: result.Error ?? "ok");
         });
         return (await Task.WhenAll(checks)).ToDictionary(c => c.Name, c => c.Status);
