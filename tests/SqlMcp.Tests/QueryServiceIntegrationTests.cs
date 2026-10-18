@@ -765,6 +765,21 @@ public class QueryServiceIntegrationTests
         Assert.Contains(expected, json);
     }
 
+    [SkippableTheory]
+    [InlineData(DbProvider.Postgres, "SELECT pg_sleep(10) AS s")]
+    [InlineData(DbProvider.MySql, "SELECT COUNT(*) AS n FROM information_schema.columns a, information_schema.columns b, information_schema.columns c")]
+    [InlineData(DbProvider.SqlServer, "WITH n AS (SELECT CAST(1 AS bigint) AS i UNION ALL SELECT i + 1 FROM n WHERE i < 100000000) SELECT MAX(i) AS m FROM n OPTION (MAXRECURSION 0)")]
+    [InlineData(DbProvider.Oracle, "SELECT COUNT(*) AS n FROM all_objects a, all_objects b, all_objects c")]
+    public async Task Says_when_a_query_ran_past_the_timeout(DbProvider provider, string sql)
+    {
+        var db = RequireDb(provider);
+        var svc = Service(db, settings: new() { ["App:QueryTimeoutSeconds"] = "1" });
+
+        var result = await svc.ExecuteAsync(new("test", sql));
+
+        Assert.Equal("Query timed out after 1 s (App:QueryTimeoutSeconds). Narrow it with a WHERE clause or an index, or ask for fewer rows.", result.Error);
+    }
+
     [SkippableFact]
     public async Task Rejects_queries_beyond_the_concurrency_limit()
     {

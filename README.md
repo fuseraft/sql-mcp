@@ -90,7 +90,7 @@ All settings live in `appsettings.json`.
 | `App:AllowedOrigins` | `[]` | Browser origins allowed to call the server. Requests carrying any other `Origin` header are rejected. |
 | `App:AllowUnauthenticated` | `false` | Allow listening beyond localhost without `AuthToken`, for when a proxy in front authenticates. |
 | `App:MaxRows` | `1000` | Maximum rows returned per query, and tables per `list_tables`. Response includes `"truncated": true` when the limit is hit. |
-| `App:QueryTimeoutSeconds` | `30` | Per-query timeout in seconds. Also how long a query waits for a free slot when `MaxConcurrentQueries` are already running. |
+| `App:QueryTimeoutSeconds` | `30` | Per-query timeout in seconds; a query that runs longer fails with "Query timed out after N s". Also how long a query waits for a free slot when `MaxConcurrentQueries` are already running. |
 | `App:MaxValueLength` | `10000` | Longest string returned for a single value, in characters. Longer text and binary values are cut off and marked `… [truncated: N characters in total]`. |
 | `App:MaxResultBytes` | `4000000` | Approximate size limit for one query's result. Rows stop being added once it's reached, and the response says `"truncated": true`. |
 | `App:MaxConcurrentQueries` | `8` | Queries that may run at once against each database. Further queries wait up to `QueryTimeoutSeconds`, then fail with "Database 'x' is busy". |

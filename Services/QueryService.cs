@@ -300,12 +300,28 @@ public class QueryService
             {
                 await Task.Delay(OracleRetryDelays[attempt], ct);
             }
+            catch (Exception ex) when (IsTimeout(ex))
+            {
+                return new(default, $"Query timed out after {_queryTimeoutSeconds} s (App:QueryTimeoutSeconds). Narrow it with a WHERE clause or an index, or ask for fewer rows.");
+            }
             catch (Exception ex)
             {
                 return new(default, $"Query error: {ex.Message}");
             }
         }
     }
+
+    // How each driver reports a command that ran past CommandTimeout. Cancellation the
+    // caller asked for is rethrown before this is reached, so a cancel here is a timeout.
+    private static bool IsTimeout(Exception ex) => ex switch
+    {
+        OperationCanceledException or TimeoutException => true,
+        Npgsql.NpgsqlException { InnerException: TimeoutException } => true,
+        Microsoft.Data.SqlClient.SqlException { Number: -2 } => true,
+        MySqlException { ErrorCode: MySqlErrorCode.CommandTimeoutExpired } => true,
+        OracleException { Number: 1013 } => true,
+        _ => false,
+    };
 
     private async Task<Result<T, string>> RunOnceAsync<T>(DbConfig db, Func<Func<DbCommand>, Task<T>> work, CancellationToken ct)
     {
