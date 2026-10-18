@@ -24,31 +24,37 @@ public sealed class SqlTools(QueryService svc)
     [McpServerTool(Name = "list_tables", ReadOnly = true, Idempotent = true)]
     [Description("List the tables and views the database login can read, as JSON. System schemas are left out unless named.")]
     public async Task<CallToolResult> ListTables(
+        RequestContext<CallToolRequestParams> context,
         [Description("Database name from list_databases.")] string dbName,
         [Description("Only list this schema (on MySQL, the database). Optional.")] string? schema = null,
         CancellationToken cancellationToken = default) =>
-        Serialize(await svc.ListTablesAsync(dbName, schema, cancellationToken));
+        Serialize(await svc.ListTablesAsync(dbName, schema, Agent(context), cancellationToken));
 
     [McpServerTool(Name = "describe_table", ReadOnly = true, Idempotent = true)]
     [Description("Describe a table or view's columns: name, data type, nullability and primary key, as JSON.")]
     public async Task<CallToolResult> DescribeTable(
+        RequestContext<CallToolRequestParams> context,
         [Description("Database name from list_databases.")] string dbName,
         [Description("Table or view name, optionally schema-qualified (\"sales.orders\"). Case-insensitive.")] string table,
         [Description("Schema containing the table. Optional; needed only when the name exists in more than one schema.")] string? schema = null,
         CancellationToken cancellationToken = default) =>
-        Serialize(await svc.DescribeTableAsync(dbName, table, schema, cancellationToken));
+        Serialize(await svc.DescribeTableAsync(dbName, table, schema, Agent(context), cancellationToken));
 
     [McpServerTool(Name = "query_database", ReadOnly = true)]
     [Description("Execute a read-only SELECT query on the specified database and return the columns and rows as JSON. " +
                  "Pass values through parameters rather than writing them into the SQL: they are bound by the database, " +
                  "so quotes in values need no escaping and can't change the query.")]
     public async Task<CallToolResult> QueryDatabase(
+        RequestContext<CallToolRequestParams> context,
         [Description("Database name from list_databases.")] string dbName,
         [Description("SELECT query to execute. Refer to parameters as @name on SQL Server, Postgres and MySQL, and as :name on Oracle.")] string sql,
         [Description("Values for the query's placeholders, by name without the @ or :, e.g. {\"customer\": \"O'Brien\", \"minTotal\": 100}. " +
                      "Values may be strings, numbers, booleans or null. Optional.")] Dictionary<string, JsonElement>? parameters = null,
         CancellationToken cancellationToken = default) =>
-        Serialize(await svc.ExecuteAsync(new QueryRequest(dbName, sql, parameters), cancellationToken));
+        Serialize(await svc.ExecuteAsync(new QueryRequest(dbName, sql, parameters), Agent(context), cancellationToken));
+
+    // The agent HttpSecurity matched the bearer token to; null over stdio or without tokens.
+    private static string? Agent(RequestContext<CallToolRequestParams> context) => context.User?.Identity?.Name;
 
     // An expected failure (unknown database, rejected statement, refused login) is an isError result, not an
     // exception: the SDK would log a thrown one as unhandled, with a stack trace, and prefix its message.

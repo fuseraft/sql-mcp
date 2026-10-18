@@ -21,7 +21,11 @@ public class HealthTests
         Assert.Equal(expected, HealthCheck.LocalUrl(urls));
 
     private static HttpClient Client(string? token = null) =>
-        new WebApplicationFactory<Program>().WithWebHostBuilder(b => b.UseSetting("App:AuthToken", token ?? "")).CreateClient();
+        new WebApplicationFactory<Program>().WithWebHostBuilder(b =>
+        {
+            if (token is not null)
+                b.UseSetting("App:AgentTokens:test", token);
+        }).CreateClient();
 
     // The sample config's databases have no passwords set, so none are ready.
     [Fact]
