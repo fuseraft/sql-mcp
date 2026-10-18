@@ -1,4 +1,4 @@
-using ModelContextProtocol;
+using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 using SqlMcp.Models;
 using SqlMcp.Services;
@@ -23,7 +23,7 @@ public sealed class SqlTools(QueryService svc)
 
     [McpServerTool(Name = "list_tables", ReadOnly = true, Idempotent = true)]
     [Description("List the tables and views the database login can read, as JSON. System schemas are left out unless named.")]
-    public async Task<string> ListTables(
+    public async Task<CallToolResult> ListTables(
         [Description("Database name from list_databases.")] string dbName,
         [Description("Only list this schema (on MySQL, the database). Optional.")] string? schema = null,
         CancellationToken cancellationToken = default) =>
@@ -31,7 +31,7 @@ public sealed class SqlTools(QueryService svc)
 
     [McpServerTool(Name = "describe_table", ReadOnly = true, Idempotent = true)]
     [Description("Describe a table or view's columns: name, data type, nullability and primary key, as JSON.")]
-    public async Task<string> DescribeTable(
+    public async Task<CallToolResult> DescribeTable(
         [Description("Database name from list_databases.")] string dbName,
         [Description("Table or view name, optionally schema-qualified (\"sales.orders\"). Case-insensitive.")] string table,
         [Description("Schema containing the table. Optional; needed only when the name exists in more than one schema.")] string? schema = null,
@@ -42,7 +42,7 @@ public sealed class SqlTools(QueryService svc)
     [Description("Execute a read-only SELECT query on the specified database and return the columns and rows as JSON. " +
                  "Pass values through parameters rather than writing them into the SQL: they are bound by the database, " +
                  "so quotes in values need no escaping and can't change the query.")]
-    public async Task<string> QueryDatabase(
+    public async Task<CallToolResult> QueryDatabase(
         [Description("Database name from list_databases.")] string dbName,
         [Description("SELECT query to execute. Refer to parameters as @name on SQL Server, Postgres and MySQL, and as :name on Oracle.")] string sql,
         [Description("Values for the query's placeholders, by name without the @ or :, e.g. {\"customer\": \"O'Brien\", \"minTotal\": 100}. " +
@@ -50,12 +50,11 @@ public sealed class SqlTools(QueryService svc)
         CancellationToken cancellationToken = default) =>
         Serialize(await svc.ExecuteAsync(new QueryRequest(dbName, sql, parameters), cancellationToken));
 
-    private static string Serialize<T>(QueryService.Result<T, string> result)
+    // An expected failure (unknown database, rejected statement, refused login) is an isError result, not an
+    // exception: the SDK would log a thrown one as unhandled, with a stack trace, and prefix its message.
+    private static CallToolResult Serialize<T>(QueryService.Result<T, string> result) => new()
     {
-        // McpException messages are returned to the client as an isError tool result.
-        if (result.IsError)
-            throw new McpException(result.Error!);
-
-        return JsonSerializer.Serialize(result.Value, JsonOptions);
-    }
+        Content = [new TextContentBlock { Text = result.IsError ? result.Error! : JsonSerializer.Serialize(result.Value, JsonOptions) }],
+        IsError = result.IsError,
+    };
 }

@@ -6,23 +6,26 @@ namespace SqlMcp.Tests;
 
 public class McpToolsTests
 {
-    private static async Task<JsonElement> ListToolsAsync()
+    private static async Task<JsonElement> ListToolsAsync() =>
+        (await PostAsync("""{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}""")).GetProperty("tools");
+
+    private static async Task<JsonElement> PostAsync(string body)
     {
         using var client = new WebApplicationFactory<Program>().CreateClient();
         var request = new HttpRequestMessage(HttpMethod.Post, "/mcp")
         {
-            Content = new StringContent("""{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}""", Encoding.UTF8, "application/json")
+            Content = new StringContent(body, Encoding.UTF8, "application/json")
         };
         request.Headers.Accept.ParseAdd("application/json");
         request.Headers.Accept.ParseAdd("text/event-stream");
 
         var response = await client.SendAsync(request);
         response.EnsureSuccessStatusCode();
-        var body = await response.Content.ReadAsStringAsync();
+        var text = await response.Content.ReadAsStringAsync();
 
         // The response is either plain JSON or a single server-sent event.
-        var json = body.Split('\n').FirstOrDefault(l => l.StartsWith("data: "))?["data: ".Length..] ?? body;
-        return JsonDocument.Parse(json).RootElement.GetProperty("result").GetProperty("tools");
+        var json = text.Split('\n').FirstOrDefault(l => l.StartsWith("data: "))?["data: ".Length..] ?? text;
+        return JsonDocument.Parse(json).RootElement.GetProperty("result");
     }
 
     [Theory]
@@ -39,5 +42,15 @@ public class McpToolsTests
         var schema = tool.GetProperty("inputSchema");
         var actual = schema.TryGetProperty("required", out var r) ? r.EnumerateArray().Select(e => e.GetString()!).ToArray() : [];
         Assert.Equal(required.Order(), actual.Order());
+    }
+
+    [Fact]
+    public async Task A_refused_call_is_an_error_result_with_just_the_reason()
+    {
+        var result = await PostAsync("""{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query_database","arguments":{"dbName":"nope","sql":"SELECT 1"}}}""");
+
+        Assert.True(result.GetProperty("isError").GetBoolean());
+        var text = result.GetProperty("content")[0].GetProperty("text").GetString()!;
+        Assert.StartsWith("Unknown database 'nope'", text);
     }
 }
