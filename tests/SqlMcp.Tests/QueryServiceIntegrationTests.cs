@@ -198,10 +198,13 @@ public class QueryServiceIntegrationTests
         Assert.Null(over.Error);
         Assert.Equal(2, over.Value!.Rows.Length);
         Assert.True(over.Value.Truncated);
+        Assert.Contains("first 2 rows", over.Value.Note);
+        Assert.Contains(provider is DbProvider.Postgres or DbProvider.MySql ? "LIMIT 2 OFFSET 2" : "OFFSET 2 ROWS FETCH NEXT 2 ROWS ONLY", over.Value.Note);
 
         var exact = await Service(db, maxRows: 3).ExecuteAsync(new("test", $"SELECT id FROM {Table}"));
         Assert.Equal(3, exact.Value!.Rows.Length);
         Assert.False(exact.Value.Truncated);
+        Assert.Null(exact.Value.Note);
     }
 
     [SkippableTheory]
@@ -503,7 +506,7 @@ public class QueryServiceIntegrationTests
             _ => "SYS"
         };
 
-        var all = await Service(db, maxRows: 100_000).ListTablesAsync("test", null);
+        var all = await Service(db, settings: new() { ["App:MaxTables"] = "100000" }).ListTablesAsync("test", null);
         Assert.Null(all.Error);
         Assert.DoesNotContain(all.Value!.Tables, t => t.Schema.Equals(system, StringComparison.OrdinalIgnoreCase));
 
@@ -522,10 +525,15 @@ public class QueryServiceIntegrationTests
         var db = RequireDb(provider);
         var schema = await SeedSchemaAsync(db);
 
-        var result = await Service(db, maxRows: 1).ListTablesAsync("test", schema);
+        var result = await Service(db, maxRows: 1, settings: new() { ["App:MaxTables"] = "1" }).ListTablesAsync("test", schema);
 
         Assert.Single(result.Value!.Tables);
         Assert.True(result.Value.Truncated);
+        Assert.Contains("App:MaxTables", result.Value.Note);
+
+        // MaxRows limits query results, not the table list.
+        var rowsCapped = await Service(db, maxRows: 1).ListTablesAsync("test", schema);
+        Assert.False(rowsCapped.Value!.Truncated);
     }
 
     [SkippableTheory]
@@ -597,7 +605,7 @@ public class QueryServiceIntegrationTests
             $"SELECT id FROM {Table} WHERE name = {P(provider, "name")}", """{"name": "O'Brien"}"""));
 
         Assert.True(result.Error is null, result.Error);
-        Assert.Equal(4, Convert.ToInt32(Assert.Single(result.Value!.Rows).Values.Single()));
+        Assert.Equal(4, Convert.ToInt32(Assert.Single(result.Value!.Rows).Single()));
     }
 
     // Written into the SQL, each of these would change the query. Bound, they are just
@@ -650,7 +658,7 @@ public class QueryServiceIntegrationTests
             """{"a": 1, "b": 3}"""));
 
         Assert.True(result.Error is null, result.Error);
-        Assert.Equal([1, 3], result.Value!.Rows.Select(r => Convert.ToInt32(r.Values.Single())));
+        Assert.Equal([1, 3], result.Value!.Rows.Select(r => Convert.ToInt32(r.Single())));
     }
 
     // Postgres won't compare text with a date; strings are sent untyped so it infers the type.
@@ -700,7 +708,7 @@ public class QueryServiceIntegrationTests
 
         Assert.True(result.Error is null, result.Error);
         Assert.Equal(["a", "a_2", "b"], result.Value!.Columns.Select(c => c.ToLowerInvariant()));
-        Assert.Equal([1, 2, 3], result.Value.Rows.Single().Values.Select(Convert.ToInt32));
+        Assert.Equal([1, 2, 3], result.Value.Rows.Single().Select(Convert.ToInt32));
     }
 
     [SkippableTheory]
@@ -726,7 +734,7 @@ public class QueryServiceIntegrationTests
 
         var result = await Service(db, settings: new() { ["App:MaxValueLength"] = "100" }).ExecuteAsync(new("test", sql));
 
-        var value = Assert.IsType<string>(result.Value!.Rows.Single().Values.Single());
+        var value = Assert.IsType<string>(result.Value!.Rows.Single().Single());
         Assert.StartsWith(new string('x', 100) + "…", value);
         Assert.Contains("[truncated: 500 characters in total]", value);
     }
@@ -744,6 +752,7 @@ public class QueryServiceIntegrationTests
         Assert.True(result.Error is null, result.Error);
         Assert.InRange(result.Value!.Rows.Length, 1, 2);
         Assert.True(result.Value.Truncated);
+        Assert.Contains("App:MaxResultBytes", result.Value.Note);
     }
 
     // Each of these failed the whole query, or threw while serializing it.
@@ -766,7 +775,7 @@ public class QueryServiceIntegrationTests
         var result = await Service(db).ExecuteAsync(new("test", sql));
 
         Assert.True(result.Error is null, result.Error);
-        var json = JsonSerializer.Serialize(result.Value!.Rows.Single().Values.Single());
+        var json = JsonSerializer.Serialize(result.Value!.Rows.Single().Single());
         Assert.Contains(expected, json);
     }
 

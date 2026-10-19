@@ -89,10 +89,11 @@ All settings live in `appsettings.json`.
 | `App:AgentTokens` | `{}` | Each agent's name and the bearer token it sends on `/mcp` and `/api/*`, e.g. `{"reporting": "<token>"}`. Calls are logged under the agent's name (see [Logging](#logging)). Set tokens with env vars such as `App__AgentTokens__reporting` rather than in the file, and keep names to letters, digits and underscores so they work as variable names everywhere. A blank token, or one shared by two agents, stops the server at startup. Required to listen beyond localhost. |
 | `App:AllowedOrigins` | `[]` | Browser origins allowed to call the server. Requests carrying any other `Origin` header are rejected. |
 | `App:AllowUnauthenticated` | `false` | Allow listening beyond localhost without `AgentTokens`, for when a proxy in front authenticates. |
-| `App:MaxRows` | `1000` | Maximum rows returned per query, and tables per `list_tables`. Response includes `"truncated": true` when the limit is hit. |
+| `App:MaxRows` | `100` | Maximum rows returned per query. When the limit is hit the response says `"truncated": true`, with a `note` on how to narrow or page the query. |
+| `App:MaxTables` | `1000` | Maximum tables and views returned per `list_tables`. |
 | `App:QueryTimeoutSeconds` | `30` | Per-query timeout in seconds; a query that runs longer fails with "Query timed out after N s". Also how long a query waits for a free slot when `MaxConcurrentQueries` are already running. |
 | `App:MaxValueLength` | `10000` | Longest string returned for a single value, in characters. Longer text and binary values are cut off and marked `… [truncated: N characters in total]`. |
-| `App:MaxResultBytes` | `4000000` | Approximate size limit for one query's result. Rows stop being added once it's reached, and the response says `"truncated": true`. |
+| `App:MaxResultBytes` | `100000` | Approximate size limit for one query's result, about 25,000 tokens. Rows stop being added once it's reached, and the response says `"truncated": true`. |
 | `App:MaxConcurrentQueries` | `8` | Queries that may run at once against each database. Further queries wait up to `QueryTimeoutSeconds`, then fail with "Database 'x' is busy". |
 
 The configuration is checked at startup. An invalid limit, a duplicate or missing database name, a missing or unknown `Provider`, an unparseable connection string, or a `PasswordEnvVar` without a `{password}` placeholder stops the server with every problem listed. A database whose `PasswordEnvVar` isn't set is logged as a warning and only that database is unavailable.
@@ -115,7 +116,7 @@ Example:
 {
   "App": {
     "Urls": "http://localhost:8080",
-    "MaxRows": 1000,
+    "MaxRows": 100,
     "QueryTimeoutSeconds": 30
   },
   "Databases": [
@@ -165,7 +166,11 @@ All tools are annotated `readOnlyHint: true`. Every call that touches a database
 
 #### `list_databases`
 
-Returns the names of all configured databases as a JSON array, e.g. `["prod","reporting"]`.
+Returns each configured database with its provider, which tells the agent which SQL dialect to write:
+
+```json
+[{ "name": "prod", "provider": "Postgres" }, { "name": "legacy", "provider": "SqlServer" }]
+```
 
 #### `list_tables`
 
@@ -174,7 +179,7 @@ Returns the names of all configured databases as a JSON array, e.g. `["prod","re
 | `dbName` | string | Database name from `list_databases`. |
 | `schema` | string, optional | Only list this schema (on MySQL, this is a database name). Matched case-insensitively. |
 
-Returns the tables and views the login can read, sorted by schema and name. System schemas (`pg_catalog`, `information_schema`, MySQL's `mysql` and `sys`, Oracle-maintained schemas such as `SYS`) are left out unless you name one with `schema`. On SQL Server only the database in the connection string is listed. At most `App:MaxRows` entries are returned:
+Returns the tables and views the login can read, sorted by schema and name. System schemas (`pg_catalog`, `information_schema`, MySQL's `mysql` and `sys`, Oracle-maintained schemas such as `SYS`) are left out unless you name one with `schema`. On SQL Server only the database in the connection string is listed. At most `App:MaxTables` entries are returned; beyond that the response says `"truncated": true` with a `note`:
 
 ```json
 { "tables": [{ "schema": "sales", "name": "orders", "type": "table" }, { "schema": "sales", "name": "open_orders", "type": "view" }], "truncated": false }
@@ -219,13 +224,20 @@ Put values in `parameters` instead of writing them into the SQL. They are sent t
 
 Names are letters, digits and underscores (a leading `@` or `:` in the key is ignored), up to 100 per query. A placeholder can be used more than once. Whole numbers are bound as 64-bit integers, other numbers as decimals. On Postgres, strings are sent untyped so the server infers the type from where the placeholder is used, as it does for a quoted literal: `WHERE created_at > @since` with `"2024-01-01"` compares dates. Where Postgres can't infer a type (`@x IS NULL`), cast the placeholder: `CAST(@x AS text) IS NULL`.
 
-Returns the result as JSON text:
+Returns the result as JSON text, each row an array of values in the order of `columns`:
 
 ```json
-{ "columns": ["id", "name"], "rows": [{ "id": 1, "name": "Ada" }], "truncated": false }
+{ "columns": ["id", "name"], "rows": [[1, "Ada"], [2, "Grace"]], "truncated": false }
 ```
 
-Every column keeps its value: unnamed columns are called `column1`, `column2`, ... and repeated names get a suffix (`SELECT a.id, b.id` returns `id` and `id_2`). Values JSON can't hold are converted:
+A result cut short by `App:MaxRows` or `App:MaxResultBytes` says so, and its `note` says what to do next, with paging in the database's own syntax:
+
+```json
+{ "columns": ["id"], "rows": [[1], [2]], "truncated": true,
+  "note": "Only the first 100 rows are shown (App:MaxRows). Narrow the query with WHERE, summarize it with GROUP BY, or page through it with ORDER BY ... LIMIT 100 OFFSET 100." }
+```
+
+Every column has a distinct name: unnamed columns are called `column1`, `column2`, ... and repeated names get a suffix (`SELECT a.id, b.id` returns `id` and `id_2`). Values JSON can't hold are converted:
 - `NaN` and infinite floats become the strings `"NaN"`, `"Infinity"`, `"-Infinity"`.
 - Oracle `NUMBER`s beyond 28 significant digits are rounded (`1/3`), and integers too large for a decimal come back as strings.
 - Binary values are base64.
@@ -388,6 +400,7 @@ sql-mcp/
 ├── Http/HealthCheck.cs               # --healthcheck mode for container probes
 ├── Models/
 │   ├── DbConfig.cs                   # Database config model
+│   ├── DatabaseInfo.cs               # list_databases entry: name and provider
 │   ├── QueryRequest.cs               # Request DTO
 │   ├── QueryResult.cs                # Response DTO
 │   └── SchemaInfo.cs                 # list_tables / describe_table results

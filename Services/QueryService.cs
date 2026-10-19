@@ -23,6 +23,7 @@ public class QueryService
 
     private readonly List<DbConfig> _dbs;
     private readonly int _maxRows;
+    private readonly int _maxTables;
     private readonly int _queryTimeoutSeconds;
     private readonly int _maxValueLength;
     private readonly long _maxResultBytes;
@@ -49,10 +50,12 @@ public class QueryService
             throw new InvalidOperationException($"Invalid configuration: {ex.Message} {ex.InnerException?.Message}".Trim(), ex);
         }
 
-        _maxRows = Positive(config, "App:MaxRows", 1000, errors);
+        _maxRows = Positive(config, "App:MaxRows", 100, errors);
+        _maxTables = Positive(config, "App:MaxTables", 1000, errors);
         _queryTimeoutSeconds = Positive(config, "App:QueryTimeoutSeconds", 30, errors);
         _maxValueLength = Positive(config, "App:MaxValueLength", 10_000, errors);
-        _maxResultBytes = Positive(config, "App:MaxResultBytes", 4_000_000, errors);
+        // Results go into a model's context: 100 KB is roughly 25,000 tokens.
+        _maxResultBytes = Positive(config, "App:MaxResultBytes", 100_000, errors);
         int maxConcurrent = Positive(config, "App:MaxConcurrentQueries", 8, errors);
 
         // The binder turns a missing or misspelled Provider into SqlServer, the enum's
@@ -169,7 +172,7 @@ public class QueryService
             cmd.CommandText = verdict.Sql;
             foreach (var (name, value) in parameters)
                 QueryParameters.Add(cmd, db.Provider, name, value);
-            return Ok(await ReadResultAsync(cmd, ct));
+            return Ok(await ReadResultAsync(cmd, db.Provider, ct));
         }, ct);
     }
 
@@ -185,9 +188,11 @@ public class QueryService
 
         return await RunAsync(db, operation, agent, async newCommand =>
         {
-            var tables = await SchemaCatalog.FindTablesAsync(newCommand, db.Provider, NullIfBlank(schema), null, _maxRows, ct);
-            return Ok(tables.Count > _maxRows
-                ? new TableList([.. tables.Take(_maxRows)], Truncated: true)
+            schema = NullIfBlank(schema);
+            var tables = await SchemaCatalog.FindTablesAsync(newCommand, db.Provider, schema, null, _maxTables, ct);
+            return Ok(tables.Count > _maxTables
+                ? new TableList([.. tables.Take(_maxTables)], Truncated: true,
+                    $"Only the first {_maxTables} tables are shown (App:MaxTables).{(schema is null ? " Pass schema to list one schema at a time." : "")}")
                 : new TableList([.. tables]));
         }, ct);
     }
@@ -401,10 +406,10 @@ public class QueryService
         return audit.Findings.Count == 0;
     }
 
-    public string[] ListDatabases(string? agent = null)
+    public DatabaseInfo[] ListDatabases(string? agent = null)
     {
         _logger.LogInformation("Listed {Count} databases for {Agent}.", _dbs.Count, Who(agent));
-        return [.. _dbs.Select(d => d.Name)];
+        return [.. _dbs.Select(d => new DatabaseInfo(d.Name, d.Provider.ToString()))];
     }
 
     /// <summary>
@@ -421,51 +426,56 @@ public class QueryService
         return (await Task.WhenAll(checks)).ToDictionary(c => c.Name, c => c.Status);
     }
 
-    private async Task<QueryResult> ReadResultAsync(DbCommand cmd, CancellationToken ct)
+    private async Task<QueryResult> ReadResultAsync(DbCommand cmd, DbProvider provider, CancellationToken ct)
     {
         await using var reader = await cmd.ExecuteReaderAsync(ct);
         ResultValues.Prepare(reader);
 
         var columns = UniqueColumnNames(Enumerable.Range(0, reader.FieldCount).Select(reader.GetName));
 
-        var rows = new List<Dictionary<string, object?>>();
-        var truncated = false;
+        var rows = new List<object?[]>();
+        string? note = null;
         long size = columns.Sum(c => c.Length + 4L);
         while (await reader.ReadAsync(ct))
         {
             if (rows.Count == _maxRows)
             {
-                truncated = true;
+                note = $"Only the first {_maxRows} rows are shown (App:MaxRows). Narrow the query with WHERE, " +
+                       $"summarize it with GROUP BY, or page through it with {PagingClause(provider, _maxRows)}.";
                 break;
             }
 
-            var row = new Dictionary<string, object?>(columns.Length);
+            var row = new object?[columns.Length];
             long rowSize = 2;
             for (int i = 0; i < columns.Length; i++)
             {
-                var value = LimitLength(ResultValues.Read(reader, i));
-                row[columns[i]] = value;
-                rowSize += columns[i].Length + 4 + EstimateSize(value);
+                row[i] = LimitLength(ResultValues.Read(reader, i));
+                rowSize += EstimateSize(row[i]) + 1;
             }
 
             // Stop before the response outgrows App:MaxResultBytes; the first row is
             // always returned, since its values are already capped.
             if (rows.Count > 0 && size + rowSize > _maxResultBytes)
             {
-                truncated = true;
+                note = $"Stopped after {rows.Count} rows: the result reached about {_maxResultBytes} bytes (App:MaxResultBytes). " +
+                       "Select fewer or shorter columns, or fewer rows.";
                 break;
             }
             size += rowSize;
             rows.Add(row);
         }
 
-        return new QueryResult(columns, [.. rows], truncated);
+        return new QueryResult(columns, [.. rows], Truncated: note is not null, note);
     }
 
+    private static string PagingClause(DbProvider provider, int pageSize) => provider is DbProvider.Postgres or DbProvider.MySql
+        ? $"ORDER BY ... LIMIT {pageSize} OFFSET {pageSize}"
+        : $"ORDER BY ... OFFSET {pageSize} ROWS FETCH NEXT {pageSize} ROWS ONLY";
+
     /// <summary>
-    /// Rows are keyed by column name, so "SELECT 1, 2" or "SELECT a.id, b.id" would
-    /// otherwise lose all but one value. Unnamed columns become column1, column2, ...
-    /// and repeats get a suffix: id, id_2.
+    /// Gives every column a distinct name, so "SELECT 1, 2" or "SELECT a.id, b.id" can
+    /// be told apart. Unnamed columns become column1, column2, ... and repeats get a
+    /// suffix: id, id_2.
     /// </summary>
     public static string[] UniqueColumnNames(IEnumerable<string?> names)
     {

@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc.Testing;
+using SqlMcp.Models;
 using System.Text;
 using System.Text.Json;
 
@@ -42,6 +43,26 @@ public class McpToolsTests
         var schema = tool.GetProperty("inputSchema");
         var actual = schema.TryGetProperty("required", out var r) ? r.EnumerateArray().Select(e => e.GetString()!).ToArray() : [];
         Assert.Equal(required.Order(), actual.Order());
+    }
+
+    [Fact]
+    public async Task Lists_databases_with_their_provider()
+    {
+        var result = await PostAsync("""{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_databases","arguments":{}}}""");
+
+        var text = result.GetProperty("content")[0].GetProperty("text").GetString()!;
+        var databases = JsonDocument.Parse(text).RootElement.EnumerateArray()
+            .ToDictionary(d => d.GetProperty("name").GetString()!, d => d.GetProperty("provider").GetString());
+        Assert.Equal("SqlServer", databases["sampleSql"]);
+        Assert.Equal("Oracle", databases["sampleOracle"]);
+    }
+
+    [Fact]
+    public void Leaves_the_note_out_of_a_complete_result()
+    {
+        var json = JsonSerializer.Serialize(new QueryResult(["id"], [[1]]), new JsonSerializerOptions(JsonSerializerDefaults.Web));
+
+        Assert.Equal("""{"columns":["id"],"rows":[[1]],"truncated":false}""", json);
     }
 
     [Fact]
