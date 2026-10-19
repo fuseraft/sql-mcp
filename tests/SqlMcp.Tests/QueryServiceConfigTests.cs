@@ -22,6 +22,7 @@ public class QueryServiceConfigTests
 
     [Theory]
     [InlineData("App:MaxRows", "0", "App:MaxRows must be at least 1")]
+    [InlineData("App:MaxTables", "0", "App:MaxTables must be at least 1")]
     [InlineData("App:QueryTimeoutSeconds", "0", "App:QueryTimeoutSeconds must be at least 1")]
     [InlineData("App:MaxConcurrentQueries", "-1", "App:MaxConcurrentQueries must be at least 1")]
     [InlineData("App:MaxValueLength", "lots", "App:MaxValueLength must be a whole number")]
@@ -29,6 +30,14 @@ public class QueryServiceConfigTests
     {
         var ex = Assert.Throws<InvalidOperationException>(() => Create([.. Db(0, "a"), (key, value)]));
         Assert.Contains(expected, ex.Message);
+    }
+
+    [Fact]
+    public void Lists_each_database_with_its_provider()
+    {
+        var svc = Create([.. Db(0, "prod"), .. Db(1, "legacy", "SqlServer", "Server=localhost;User Id=agent")]);
+
+        Assert.Equal([new("prod", "Postgres"), new("legacy", "SqlServer")], svc.ListDatabases());
     }
 
     [Fact]

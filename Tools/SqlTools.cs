@@ -18,7 +18,8 @@ public sealed class SqlTools(QueryService svc)
     };
 
     [McpServerTool(Name = "list_databases", ReadOnly = true, Idempotent = true)]
-    [Description("List the names of the databases this server can query.")]
+    [Description("List the databases this server can query, with each one's provider (SqlServer, Postgres, MySql or Oracle). " +
+                 "Write each database's SQL in its provider's dialect.")]
     public string ListDatabases(RequestContext<CallToolRequestParams> context) =>
         JsonSerializer.Serialize(svc.ListDatabases(Agent(context)), JsonOptions);
 
@@ -42,7 +43,9 @@ public sealed class SqlTools(QueryService svc)
         Serialize(await svc.DescribeTableAsync(dbName, table, schema, Agent(context), cancellationToken));
 
     [McpServerTool(Name = "query_database", ReadOnly = true)]
-    [Description("Execute a read-only SELECT query on the specified database and return the columns and rows as JSON. " +
+    [Description("Execute a read-only SELECT query on the specified database and return the columns and rows as JSON, " +
+                 "each row an array of values in column order. Results are capped in rows and size; a truncated result " +
+                 "has a note saying how to narrow or page the query. " +
                  "Pass values through parameters rather than writing them into the SQL: they are bound by the database, " +
                  "so quotes in values need no escaping and can't change the query.")]
     public async Task<CallToolResult> QueryDatabase(
