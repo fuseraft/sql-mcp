@@ -1,0 +1,12 @@
+/* A steel blue accent instead of Starlight's default purple. */
+:root {
+	--sl-color-accent-low: #13223a;
+	--sl-color-accent: #4a78bd;
+	--sl-color-accent-high: #c6d7f0;
+}
+
+:root[data-theme='light'] {
+	--sl-color-accent-low: #d5e2f5;
+	--sl-color-accent: #2f5b9a;
+	--sl-color-accent-high: #112848;
+}
