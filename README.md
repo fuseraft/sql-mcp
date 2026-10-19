@@ -182,8 +182,12 @@ Returns each configured database with its provider, which tells the agent which 
 Returns the tables and views the login can read, sorted by schema and name. System schemas (`pg_catalog`, `information_schema`, MySQL's `mysql` and `sys`, Oracle-maintained schemas such as `SYS`) are left out unless you name one with `schema`. On SQL Server only the database in the connection string is listed. At most `App:MaxTables` entries are returned; beyond that the response says `"truncated": true` with a `note`:
 
 ```json
-{ "tables": [{ "schema": "sales", "name": "orders", "type": "table" }, { "schema": "sales", "name": "open_orders", "type": "view" }], "truncated": false }
+{ "tables": [
+  { "schema": "sales", "name": "orders", "type": "table", "approxRows": 1250000, "comment": "One row per order placed" },
+  { "schema": "sales", "name": "open_orders", "type": "view" } ], "truncated": false }
 ```
+
+`approxRows` is the database's own estimate from its statistics (`reltuples` on Postgres, `sys.partitions` on SQL Server, `table_rows` on MySQL, `num_rows` on Oracle), so an agent can tell a lookup table from one it shouldn't scan. It's left out for views, and for tables whose statistics were never gathered. `comment` is the table's comment (`COMMENT ON TABLE`, SQL Server's `MS_Description` extended property, MySQL's table `COMMENT`), shortened to 200 characters here and in full from `describe_table`; it's left out when there is none.
 
 #### `describe_table`
 
@@ -193,15 +197,19 @@ Returns the tables and views the login can read, sorted by schema and name. Syst
 | `table` | string | Table or view name, matched case-insensitively. `schema.table` is accepted. |
 | `schema` | string, optional | Needed only when the name exists in more than one schema. Without it, every non-system schema is searched. |
 
-Returns the columns in order, with the type as the database spells it (`character varying(20)`, `nvarchar(max)`, `NUMBER(10,2)`):
+Returns the table's comment and estimated row count (as in `list_tables`), its columns in order with the type as the database spells it (`character varying(20)`, `nvarchar(max)`, `NUMBER(10,2)`) and each column's comment, the foreign keys it holds, and the foreign keys of other tables that reference it:
 
 ```json
-{ "schema": "sales", "name": "orders", "type": "table", "columns": [
-  { "name": "id", "dataType": "integer", "nullable": false, "primaryKey": true },
-  { "name": "customer", "dataType": "character varying(100)", "nullable": true, "primaryKey": false } ] }
+{ "schema": "sales", "name": "orders", "type": "table", "comment": "One row per order placed", "approxRows": 1250000,
+  "columns": [
+    { "name": "id", "dataType": "integer", "nullable": false, "primaryKey": true },
+    { "name": "customer_id", "dataType": "integer", "nullable": false, "primaryKey": false, "comment": "Who placed the order" },
+    { "name": "status", "dataType": "smallint", "nullable": false, "primaryKey": false, "comment": "1 open, 2 shipped, 3 cancelled" } ],
+  "foreignKeys": [{ "columns": ["customer_id"], "referencedTable": "sales.customers", "referencedColumns": ["id"] }],
+  "referencedBy": [{ "table": "sales.order_lines", "columns": ["order_id"], "referencedColumns": ["id"] }] }
 ```
 
-A table the login can't read is reported as not found.
+Agents choose join columns from the foreign keys instead of guessing from names. A key between two tables is listed only if the login can read the other table, and a key from a table to itself is listed once, under `foreignKeys`. A table the login can't read is reported as not found.
 
 #### `query_database`
 

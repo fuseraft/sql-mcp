@@ -24,7 +24,8 @@ public sealed class SqlTools(QueryService svc)
         JsonSerializer.Serialize(svc.ListDatabases(Agent(context)), JsonOptions);
 
     [McpServerTool(Name = "list_tables", ReadOnly = true, Idempotent = true)]
-    [Description("List the tables and views the database login can read, as JSON. System schemas are left out unless named.")]
+    [Description("List the tables and views the database login can read, as JSON, with each table's estimated row count " +
+                 "and comment where the database has them. System schemas are left out unless named.")]
     public async Task<CallToolResult> ListTables(
         RequestContext<CallToolRequestParams> context,
         [Description("Database name from list_databases.")] string dbName,
@@ -33,7 +34,9 @@ public sealed class SqlTools(QueryService svc)
         Serialize(await svc.ListTablesAsync(dbName, schema, Agent(context), cancellationToken));
 
     [McpServerTool(Name = "describe_table", ReadOnly = true, Idempotent = true)]
-    [Description("Describe a table or view's columns: name, data type, nullability and primary key, as JSON.")]
+    [Description("Describe a table or view as JSON: its comment and estimated row count, each column's name, data type, " +
+                 "nullability, primary key and comment, its foreign keys, and the foreign keys of other tables that reference it. " +
+                 "Use the foreign keys to choose join columns.")]
     public async Task<CallToolResult> DescribeTable(
         RequestContext<CallToolRequestParams> context,
         [Description("Database name from list_databases.")] string dbName,

@@ -16,6 +16,9 @@ public class QueryService
     // later GRANT is noticed without a restart.
     private static readonly TimeSpan AuditLifetime = TimeSpan.FromMinutes(5);
 
+    // list_tables shortens table comments to this many characters; describe_table has them in full.
+    private const int ListedCommentLength = 200;
+
     // ORA-01466: a read-only transaction started too soon after the table's last DDL.
     private const int OracleTableDefinitionChanged = 1466;
     private static readonly TimeSpan[] OracleRetryDelays =
@@ -189,7 +192,9 @@ public class QueryService
         return await RunAsync(db, operation, agent, async newCommand =>
         {
             schema = NullIfBlank(schema);
-            var tables = await SchemaCatalog.FindTablesAsync(newCommand, db.Provider, schema, null, _maxTables, ct);
+            var tables = (await SchemaCatalog.FindTablesAsync(newCommand, db.Provider, schema, null, _maxTables, ct))
+                .Select(t => t.Comment?.Length > ListedCommentLength ? t with { Comment = t.Comment[..ListedCommentLength] + "…" } : t)
+                .ToList();
             return Ok(tables.Count > _maxTables
                 ? new TableList([.. tables.Take(_maxTables)], Truncated: true,
                     $"Only the first {_maxTables} tables are shown (App:MaxTables).{(schema is null ? " Pass schema to list one schema at a time." : "")}")
@@ -234,7 +239,8 @@ public class QueryService
 
             var match = matches[0];
             var columns = await SchemaCatalog.GetColumnsAsync(newCommand, db.Provider, match, ct);
-            return Ok(new TableDescription(match.Schema, match.Name, match.Type, columns));
+            var (foreignKeys, referencedBy) = await SchemaCatalog.GetForeignKeysAsync(newCommand, db.Provider, match, ct);
+            return Ok(new TableDescription(match.Schema, match.Name, match.Type, match.Comment, match.ApproxRows, columns, foreignKeys, referencedBy));
         }, ct);
     }
 
