@@ -134,7 +134,7 @@ For local development, put real connection strings in `appsettings.Development.j
 
 ### Logging
 
-Each tool call and `/api/query` request is logged by `SqlMcp.Services.QueryService`: the agent, the database, the SQL (or the schema lookup), the names of any parameters, how long it took and how many rows it returned (for `list_databases`, the agent and how many databases there are). Parameter values are never logged.
+Each tool call (including `explain_query`, logged as `explain`) and `/api/query` request is logged by `SqlMcp.Services.QueryService`: the agent, the database, the SQL (or the schema lookup), the names of any parameters, how long it took and how many rows it returned (for `list_databases`, the agent and how many databases there are). Parameter values are never logged.
 
 ```
 2026-10-18T14:02:11.384Z info: SqlMcp.Services.QueryService[0]
@@ -162,7 +162,7 @@ App__MaxRows=500
 
 ### MCP tools
 
-All tools are annotated `readOnlyHint: true`. Every call that touches a database goes through the same login audit and read-only transaction (see [Security](#security)). Errors (unknown database, unknown table, rejected statement, database errors) are returned as tool results with `isError: true`.
+All tools are annotated `readOnlyHint: true`. Every call that touches a database goes through the same login audit and read-only transaction, except `explain_query` on Oracle (see [Security](#security)). Errors (unknown database, unknown table, rejected statement, database errors) are returned as tool results with `isError: true`.
 
 #### `list_databases`
 
@@ -178,6 +178,7 @@ Returns each configured database with its provider, which tells the agent which 
 |----------|------|-------------|
 | `dbName` | string | Database name from `list_databases`. |
 | `schema` | string, optional | Only list this schema (on MySQL, this is a database name). Matched case-insensitively. |
+| `search` | string, optional | Only list tables whose name or comment contains this text, ignoring case. `%`, `_` and `[` are matched as text, not wildcards. |
 
 Returns the tables and views the login can read, sorted by schema and name. System schemas (`pg_catalog`, `information_schema`, MySQL's `mysql` and `sys`, Oracle-maintained schemas such as `SYS`) are left out unless you name one with `schema`. On SQL Server only the database in the connection string is listed. At most `App:MaxTables` entries are returned; beyond that the response says `"truncated": true` with a `note`:
 
@@ -262,6 +263,23 @@ curl -s http://localhost:8080/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query_database","arguments":{"dbName":"prod","sql":"SELECT 1 AS test"}}}'
 ```
 
+#### `explain_query`
+
+Takes the same arguments as `query_database`, and the query passes the same checks, but it isn't run: the database's estimated plan comes back instead, showing how each table will be read and the estimated rows and cost. An agent can check that a query against a large table uses an index before running it.
+
+```json
+{ "plan": "Index Scan using orders_customer_idx on orders  (cost=0.43..8.45 rows=12 width=24)\n  Index Cond: (customer_id = '42'::bigint)" }
+```
+
+| Provider | Plan from |
+|----------|-----------|
+| Postgres | `EXPLAIN` (never `EXPLAIN ANALYZE`, which runs the query) |
+| MySQL | `EXPLAIN FORMAT=TREE` |
+| SQL Server | `SET SHOWPLAN_ALL ON`, under which nothing in the batch runs. Each operator is shown with its estimated rows and cost. |
+| Oracle | `EXPLAIN PLAN`, read back with `DBMS_XPLAN.DISPLAY` |
+
+On Postgres and MySQL the parameters' values are bound as for a query, so the plan reflects them. SQL Server and Oracle plan the query without the values: SQL Server declares each parameter with a type taken from its value, and Oracle plans its `:name` placeholders as unknown. A plan longer than `App:MaxResultBytes` is cut off.
+
 ### Direct query endpoint
 
 **`POST /api/query`** (HTTP mode only) — plain REST equivalent of `query_database`, for non-MCP callers.
@@ -297,7 +315,7 @@ Queries come from AI agents, so every query passes three layers before anything 
 
    Where a server setting changes how backslashes inside literals are read (MySQL `NO_BACKSLASH_ESCAPES`, Postgres `standard_conforming_strings`), the query must pass under both readings, so it can't hide text from the check.
 
-2. **Read-only transaction, always rolled back.** Every query runs inside a transaction that is rolled back afterwards, whatever happens. On Postgres, MySQL and Oracle that transaction is also read-only (`SET TRANSACTION READ ONLY` / `START TRANSACTION READ ONLY`), so the database itself refuses writes that validation can't see, such as `SELECT my_function_that_inserts()`. SQL Server has no read-only transaction mode, so there the rollback is the backstop. On Oracle, a read-only transaction started within seconds of a table's last DDL fails with `ORA-01466`; sql-mcp retries those for up to a few seconds.
+2. **Read-only transaction, always rolled back.** Every query runs inside a transaction that is rolled back afterwards, whatever happens. On Postgres, MySQL and Oracle that transaction is also read-only (`SET TRANSACTION READ ONLY` / `START TRANSACTION READ ONLY`), so the database itself refuses writes that validation can't see, such as `SELECT my_function_that_inserts()`. SQL Server has no read-only transaction mode, so there the rollback is the backstop. Oracle's `EXPLAIN PLAN` writes the plan to `PLAN_TABLE`, which a read-only transaction refuses, so `explain_query` on Oracle uses an ordinary transaction: the query is only parsed, never run, and the plan rows are rolled back. On Oracle, a read-only transaction started within seconds of a table's last DDL fails with `ORA-01466`; sql-mcp retries those for up to a few seconds.
 
 3. **Login audit.** Neither layer above can see inside a function. An Oracle function with `PRAGMA AUTONOMOUS_TRANSACTION` commits its own writes even when called from a read-only transaction that is then rolled back. So before serving a database, sql-mcp checks what its login can do. If the login could change anything or reach outside the database, every query on that database is refused, and the reasons are logged:
 
@@ -400,6 +418,7 @@ sql-mcp/
 ├── Tools/SqlTools.cs                 # MCP tool definitions
 ├── Services/QueryService.cs          # Query execution, read-only transaction, row limiting
 ├── Services/QueryParameters.cs       # Bind-parameter parsing and binding
+├── Services/QueryPlans.cs            # Per-provider estimated plans for explain_query
 ├── Services/ResultValues.cs          # Converts database values to plain JSON
 ├── Services/SchemaCatalog.cs         # Per-provider catalog queries for list_tables / describe_table
 ├── Services/SqlGuard.cs              # Provider-aware statement validation
@@ -411,6 +430,7 @@ sql-mcp/
 │   ├── DatabaseInfo.cs               # list_databases entry: name and provider
 │   ├── QueryRequest.cs               # Request DTO
 │   ├── QueryResult.cs                # Response DTO
+│   ├── QueryPlan.cs                  # explain_query result
 │   └── SchemaInfo.cs                 # list_tables / describe_table results
 ├── Properties/PublishProfiles/
 │   ├── linux-x64.pubxml

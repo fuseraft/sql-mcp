@@ -210,11 +210,12 @@ public static class SchemaCatalog
 
     /// <summary>
     /// Lists tables and views, filtered case-insensitively by schema and/or name when
-    /// given. Without a schema, system schemas are left out. Reads up to limit + 1 rows
-    /// so callers can tell when the list was cut short.
+    /// given, and by search: text the name or comment contains. Without a schema, system
+    /// schemas are left out. Reads up to limit + 1 rows so callers can tell when the list
+    /// was cut short.
     /// </summary>
     public static async Task<List<TableInfo>> FindTablesAsync(
-        Func<DbCommand> newCommand, DbProvider provider, string? schema, string? table, int limit, CancellationToken ct)
+        Func<DbCommand> newCommand, DbProvider provider, string? schema, string? table, int limit, CancellationToken ct, string? search = null)
     {
         var (source, p) = provider switch
         {
@@ -231,12 +232,15 @@ public static class SchemaCatalog
             SELECT schema_name, table_name, table_type, table_comment, approx_rows FROM ({source}) t
             WHERE (({p}p_any_schema = 1 AND is_system = 0) OR LOWER(schema_name) = LOWER({p}p_schema))
               AND ({p}p_any_table = 1 OR LOWER(table_name) = LOWER({p}p_table))
+              AND ({p}p_any_search = 1 OR LOWER(table_name) LIKE {p}p_search ESCAPE '!' OR LOWER(table_comment) LIKE {p}p_search ESCAPE '!')
             ORDER BY schema_name, table_name
             """;
         QueryParameters.Add(cmd, provider, "p_any_schema", schema is null ? 1 : 0);
         QueryParameters.Add(cmd, provider, "p_schema", schema ?? "");
         QueryParameters.Add(cmd, provider, "p_any_table", table is null ? 1 : 0);
         QueryParameters.Add(cmd, provider, "p_table", table ?? "");
+        QueryParameters.Add(cmd, provider, "p_any_search", search is null ? 1 : 0);
+        QueryParameters.Add(cmd, provider, "p_search", search is null ? "" : ContainsPattern(search, provider));
 
         var tables = new List<TableInfo>();
         await using var reader = await cmd.ExecuteReaderAsync(ct);
@@ -245,6 +249,21 @@ public static class SchemaCatalog
                 reader.IsDBNull(4) ? null : Convert.ToInt64(reader.GetValue(4)),
                 reader.IsDBNull(3) ? null : reader.GetString(3)));
         return tables;
+    }
+
+    // A LIKE pattern matching text anywhere, with the text's own wildcards escaped by '!'
+    // (a backslash means different things depending on server settings). '[' is a
+    // wildcard only on SQL Server, and Oracle refuses an escape before anything else.
+    private static string ContainsPattern(string text, DbProvider provider)
+    {
+        var escaped = new System.Text.StringBuilder();
+        foreach (var c in text.ToLowerInvariant())
+        {
+            if (c is '!' or '%' or '_' || (c == '[' && provider == DbProvider.SqlServer))
+                escaped.Append('!');
+            escaped.Append(c);
+        }
+        return $"%{escaped}%";
     }
 
     /// <summary>Returns the columns of a table found by FindTablesAsync, in order.</summary>

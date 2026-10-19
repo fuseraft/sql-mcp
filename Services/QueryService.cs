@@ -150,54 +150,94 @@ public class QueryService
     /// </summary>
     public async Task<Result<QueryResult, string>> ExecuteAsync(QueryRequest req, string? agent = null, CancellationToken ct = default)
     {
-        var refused = $"query: {req.Sql}";
-        if (string.IsNullOrWhiteSpace(req.DbName) || req.Sql is null)
-            return Refuse<QueryResult>(refused, req.DbName, agent, "Both dbName and sql are required.");
+        var (db, sql, parameters, operation, error) = Prepare(req, "query", agent);
+        if (error is not null)
+            return new(default, error);
 
-        var db = FindDatabase(req.DbName);
-        if (db == null)
-            return Refuse<QueryResult>(refused, req.DbName, agent, UnknownDatabase(req.DbName));
-
-        var verdict = SqlGuard.Validate(req.Sql, db.Provider);
-        if (!verdict.IsAllowed)
-            return Refuse<QueryResult>(refused, db.Name, agent, verdict.Error!);
-
-        var (parameters, parameterError) = QueryParameters.Parse(req.Parameters);
-        if (parameterError is not null)
-            return Refuse<QueryResult>(refused, db.Name, agent, parameterError);
-
-        var operation = parameters.Count == 0
-            ? $"query: {verdict.Sql}"
-            : $"query with parameters {string.Join(", ", parameters.Select(p => p.Key))}: {verdict.Sql}";
-        return await RunAsync(db, operation, agent, async newCommand =>
+        return await RunAsync(db!, operation, agent, async newCommand =>
         {
             await using var cmd = newCommand();
-            cmd.CommandText = verdict.Sql;
+            cmd.CommandText = sql;
             foreach (var (name, value) in parameters)
-                QueryParameters.Add(cmd, db.Provider, name, value);
-            return Ok(await ReadResultAsync(cmd, db.Provider, ct));
+                QueryParameters.Add(cmd, db!.Provider, name, value);
+            return Ok(await ReadResultAsync(cmd, db!.Provider, ct));
         }, ct);
     }
 
     /// <summary>
-    /// Lists the tables and views the login can read, optionally in one schema.
+    /// Returns the database's estimated plan for a query without running it. The query
+    /// passes the same checks as ExecuteAsync.
     /// </summary>
-    public async Task<Result<TableList, string>> ListTablesAsync(string dbName, string? schema, string? agent = null, CancellationToken ct = default)
+    public async Task<Result<QueryPlan, string>> ExplainAsync(QueryRequest req, string? agent = null, CancellationToken ct = default)
     {
-        var operation = schema is null ? "list_tables" : $"list_tables in {schema}";
+        var (db, sql, parameters, operation, error) = Prepare(req, "explain", agent);
+        if (error is not null)
+            return new(default, error);
+
+        // Oracle's EXPLAIN PLAN writes the plan to PLAN_TABLE, which a read-only
+        // transaction refuses. The query itself is only parsed, and the plan rows are
+        // rolled back with everything else.
+        return await RunAsync(db!, operation, agent, async newCommand =>
+        {
+            var plan = await QueryPlans.ExplainAsync(newCommand, db!.Provider, sql, parameters, ct);
+            return Ok(new QueryPlan(plan.Length > _maxResultBytes ? $"{plan[..(int)_maxResultBytes]}… [truncated: {plan.Length} characters in total]" : plan));
+        }, ct, readOnly: db!.Provider != DbProvider.Oracle);
+    }
+
+    /// <summary>
+    /// Checks a query request before connecting: the database exists, the SQL passes
+    /// SqlGuard and the parameters parse. A refusal is logged and returned as error.
+    /// </summary>
+    private (DbConfig? Db, string Sql, List<KeyValuePair<string, object?>> Parameters, string Operation, string? Error) Prepare(
+        QueryRequest req, string kind, string? agent)
+    {
+        (DbConfig?, string, List<KeyValuePair<string, object?>>, string, string?) Refused(string? dbName, string error) =>
+            (null, "", [], "", Refuse<bool>($"{kind}: {req.Sql}", dbName, agent, error).Error);
+
+        if (string.IsNullOrWhiteSpace(req.DbName) || req.Sql is null)
+            return Refused(req.DbName, "Both dbName and sql are required.");
+
+        var db = FindDatabase(req.DbName);
+        if (db == null)
+            return Refused(req.DbName, UnknownDatabase(req.DbName));
+
+        var verdict = SqlGuard.Validate(req.Sql, db.Provider);
+        if (!verdict.IsAllowed)
+            return Refused(db.Name, verdict.Error!);
+
+        var (parameters, parameterError) = QueryParameters.Parse(req.Parameters);
+        if (parameterError is not null)
+            return Refused(db.Name, parameterError);
+
+        var operation = parameters.Count == 0
+            ? $"{kind}: {verdict.Sql}"
+            : $"{kind} with parameters {string.Join(", ", parameters.Select(p => p.Key))}: {verdict.Sql}";
+        return (db, verdict.Sql, parameters, operation, null);
+    }
+
+    /// <summary>
+    /// Lists the tables and views the login can read, optionally in one schema, and
+    /// optionally only those whose name or comment contains search.
+    /// </summary>
+    public async Task<Result<TableList, string>> ListTablesAsync(
+        string dbName, string? schema, string? search = null, string? agent = null, CancellationToken ct = default)
+    {
+        schema = NullIfBlank(schema);
+        search = NullIfBlank(search);
+        var operation = $"list_tables{(schema is null ? "" : $" in {schema}")}{(search is null ? "" : $" matching {search}")}";
         var db = FindDatabase(dbName);
         if (db == null)
             return Refuse<TableList>(operation, dbName, agent, UnknownDatabase(dbName));
 
         return await RunAsync(db, operation, agent, async newCommand =>
         {
-            schema = NullIfBlank(schema);
-            var tables = (await SchemaCatalog.FindTablesAsync(newCommand, db.Provider, schema, null, _maxTables, ct))
+            var tables = (await SchemaCatalog.FindTablesAsync(newCommand, db.Provider, schema, null, _maxTables, ct, search))
                 .Select(t => t.Comment?.Length > ListedCommentLength ? t with { Comment = t.Comment[..ListedCommentLength] + "…" } : t)
                 .ToList();
             return Ok(tables.Count > _maxTables
                 ? new TableList([.. tables.Take(_maxTables)], Truncated: true,
-                    $"Only the first {_maxTables} tables are shown (App:MaxTables).{(schema is null ? " Pass schema to list one schema at a time." : "")}")
+                    $"Only the first {_maxTables} tables are shown (App:MaxTables). Pass search to find tables by name or comment" +
+                    $"{(schema is null ? ", or schema to list one schema at a time" : "")}.")
                 : new TableList([.. tables]));
         }, ct);
     }
@@ -245,12 +285,14 @@ public class QueryService
     }
 
     /// <summary>
-    /// Connects, checks the login, and runs work inside a read-only transaction that is
-    /// always rolled back. Commands from newCommand are bound to that transaction. work
-    /// returns an error for an outcome that isn't a database error but still failed, such
-    /// as a table that wasn't found, so it's logged as a failure.
+    /// Connects, checks the login, and runs work inside a transaction that is always
+    /// rolled back, and read-only unless readOnly is false. Commands from newCommand are
+    /// bound to that transaction. work returns an error for an outcome that isn't a
+    /// database error but still failed, such as a table that wasn't found, so it's
+    /// logged as a failure.
     /// </summary>
-    private async Task<Result<T, string>> RunAsync<T>(DbConfig db, string operation, string? agent, Func<Func<DbCommand>, Task<Result<T, string>>> work, CancellationToken ct, bool log = true)
+    private async Task<Result<T, string>> RunAsync<T>(DbConfig db, string operation, string? agent, Func<Func<DbCommand>, Task<Result<T, string>>> work, CancellationToken ct,
+        bool log = true, bool readOnly = true)
     {
         if (MissingPassword(db) is { } missing)
         {
@@ -270,7 +312,7 @@ public class QueryService
         var started = Stopwatch.GetTimestamp();
         try
         {
-            var result = await RunWithRetryAsync(db, work, ct);
+            var result = await RunWithRetryAsync(db, work, readOnly, ct);
             var elapsed = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
             if (!log)
                 return result;
@@ -311,18 +353,19 @@ public class QueryService
         QueryResult q => q.Rows.Length,
         TableList t => t.Tables.Length,
         TableDescription d => d.Columns.Length,
+        QueryPlan p => p.Plan.Split('\n').Length,
         _ => 0
     };
 
     private static bool IsTruncated(object? value) => value is QueryResult { Truncated: true } or TableList { Truncated: true };
 
-    private async Task<Result<T, string>> RunWithRetryAsync<T>(DbConfig db, Func<Func<DbCommand>, Task<Result<T, string>>> work, CancellationToken ct)
+    private async Task<Result<T, string>> RunWithRetryAsync<T>(DbConfig db, Func<Func<DbCommand>, Task<Result<T, string>>> work, bool readOnly, CancellationToken ct)
     {
         for (int attempt = 0; ; attempt++)
         {
             try
             {
-                return await RunOnceAsync(db, work, ct);
+                return await RunOnceAsync(db, work, readOnly, ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -355,7 +398,7 @@ public class QueryService
         _ => false,
     };
 
-    private async Task<Result<T, string>> RunOnceAsync<T>(DbConfig db, Func<Func<DbCommand>, Task<Result<T, string>>> work, CancellationToken ct)
+    private async Task<Result<T, string>> RunOnceAsync<T>(DbConfig db, Func<Func<DbCommand>, Task<Result<T, string>>> work, bool readOnly, CancellationToken ct)
     {
         await using var conn = db.GetFactory().CreateConnection()!;
         conn.ConnectionString = ResolveConnectionString(db);
@@ -364,7 +407,7 @@ public class QueryService
         if (!await IsLoginReadOnlyAsync(db, conn, ct))
             return new(default, $"Database '{db.Name}' is disabled because its login can modify data. The server log lists why.");
 
-        await using var tx = await BeginReadOnlyTransactionAsync(conn, db.Provider, ct);
+        await using var tx = readOnly ? await BeginReadOnlyTransactionAsync(conn, db.Provider, ct) : await conn.BeginTransactionAsync(ct);
         try
         {
             return await work(() =>

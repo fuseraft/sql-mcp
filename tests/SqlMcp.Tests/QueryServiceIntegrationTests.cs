@@ -500,6 +500,29 @@ public class QueryServiceIntegrationTests
 
     [SkippableTheory]
     [MemberData(nameof(Providers))]
+    public async Task Searches_tables_by_name_and_comment(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+        var schema = await SeedSchemaAsync(db);
+        var svc = Service(db);
+
+        async Task<string[]> Find(string search)
+        {
+            var result = await svc.ListTablesAsync("test", schema, search);
+            Assert.True(result.Error is null, result.Error);
+            return [.. result.Value!.Tables.Select(t => t.Name.ToLowerInvariant()).Order()];
+        }
+
+        // The child table's comment mentions a keyed row.
+        Assert.Equal([ChildTable, KeyedTable], await Find("KEYED"));
+        Assert.Equal([ChildTable], await Find("point at"));
+        // Wildcards in the search are matched as text.
+        Assert.Empty(await Find("sqlmcp%"));
+        Assert.Empty(await Find("sqlmcp[_]"));
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
     public async Task Describes_foreign_keys_in_both_directions(DbProvider provider)
     {
         var db = RequireDb(provider);
@@ -742,6 +765,52 @@ public class QueryServiceIntegrationTests
             Assert.True(result.Error is null, $"{attack}: {result.Error}");
             Assert.Empty(result.Value!.Rows);
         }
+        Assert.Equal(3, await CountAsync(db));
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Explains_a_query_with_parameters(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+        await SeedAsync(db);
+
+        var result = await Service(db).ExplainAsync(Query(
+            $"SELECT id, name FROM {Table} WHERE id = {P(provider, "id")} AND name = {P(provider, "name")}", """{"id": 2, "name": "row 2"}"""));
+
+        Assert.True(result.Error is null, result.Error);
+        Assert.Contains(Table, result.Value!.Plan, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("rows", result.Value.Plan, StringComparison.OrdinalIgnoreCase); // the estimate
+    }
+
+    // Dividing by zero fails only when a row is read, so the plan shows the query didn't run.
+    [SkippableTheory]
+    [InlineData(DbProvider.Postgres)]
+    [InlineData(DbProvider.SqlServer)]
+    [InlineData(DbProvider.Oracle)]
+    public async Task Explains_without_running_the_query(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+        await SeedAsync(db);
+        var svc = Service(db);
+        var sql = $"SELECT 1 / (id - id) AS boom FROM {Table}";
+
+        Assert.NotNull((await svc.ExecuteAsync(new("test", sql))).Error);
+        var explained = await svc.ExplainAsync(new("test", sql));
+        Assert.True(explained.Error is null, explained.Error);
+        Assert.NotEmpty(explained.Value!.Plan);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Explain_rejects_writes(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+        await SeedAsync(db);
+
+        var result = await Service(db).ExplainAsync(new("test", $"DELETE FROM {Table}"));
+
+        Assert.Contains("Only SELECT", result.Error);
         Assert.Equal(3, await CountAsync(db));
     }
 
