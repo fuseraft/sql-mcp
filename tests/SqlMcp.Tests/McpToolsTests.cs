@@ -34,6 +34,7 @@ public class McpToolsTests
     [InlineData("list_tables", new[] { "dbName" })]
     [InlineData("describe_table", new[] { "dbName", "table" })]
     [InlineData("query_database", new[] { "dbName", "sql" })]
+    [InlineData("explain_query", new[] { "dbName", "sql" })]
     public async Task Advertises_read_only_tools_with_their_required_arguments(string name, string[] required)
     {
         var tools = await ListToolsAsync();

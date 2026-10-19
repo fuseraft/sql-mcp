@@ -24,16 +24,20 @@ public sealed class SqlTools(QueryService svc)
         JsonSerializer.Serialize(svc.ListDatabases(Agent(context)), JsonOptions);
 
     [McpServerTool(Name = "list_tables", ReadOnly = true, Idempotent = true)]
-    [Description("List the tables and views the database login can read, as JSON. System schemas are left out unless named.")]
+    [Description("List the tables and views the database login can read, as JSON, with each table's estimated row count " +
+                 "and comment where the database has them. System schemas are left out unless named.")]
     public async Task<CallToolResult> ListTables(
         RequestContext<CallToolRequestParams> context,
         [Description("Database name from list_databases.")] string dbName,
         [Description("Only list this schema (on MySQL, the database). Optional.")] string? schema = null,
+        [Description("Only list tables whose name or comment contains this text, ignoring case, e.g. \"order\". Optional.")] string? search = null,
         CancellationToken cancellationToken = default) =>
-        Serialize(await svc.ListTablesAsync(dbName, schema, Agent(context), cancellationToken));
+        Serialize(await svc.ListTablesAsync(dbName, schema, search, Agent(context), cancellationToken));
 
     [McpServerTool(Name = "describe_table", ReadOnly = true, Idempotent = true)]
-    [Description("Describe a table or view's columns: name, data type, nullability and primary key, as JSON.")]
+    [Description("Describe a table or view as JSON: its comment and estimated row count, each column's name, data type, " +
+                 "nullability, primary key and comment, its foreign keys, and the foreign keys of other tables that reference it. " +
+                 "Use the foreign keys to choose join columns.")]
     public async Task<CallToolResult> DescribeTable(
         RequestContext<CallToolRequestParams> context,
         [Description("Database name from list_databases.")] string dbName,
@@ -56,6 +60,19 @@ public sealed class SqlTools(QueryService svc)
                      "Values may be strings, numbers, booleans or null. Optional.")] Dictionary<string, JsonElement>? parameters = null,
         CancellationToken cancellationToken = default) =>
         Serialize(await svc.ExecuteAsync(new QueryRequest(dbName, sql, parameters), Agent(context), cancellationToken));
+
+    [McpServerTool(Name = "explain_query", ReadOnly = true, Idempotent = true)]
+    [Description("Show the database's estimated plan for a SELECT query without running it: how each table will be read " +
+                 "(index or full scan), with the estimated rows and cost. Check a query against a large table before running it. " +
+                 "Takes the same arguments as query_database; the query passes the same checks.")]
+    public async Task<CallToolResult> ExplainQuery(
+        RequestContext<CallToolRequestParams> context,
+        [Description("Database name from list_databases.")] string dbName,
+        [Description("SELECT query to explain. Refer to parameters as @name on SQL Server, Postgres and MySQL, and as :name on Oracle.")] string sql,
+        [Description("Values for the query's placeholders, by name without the @ or :. Optional. " +
+                     "SQL Server and Oracle plan the query without the values.")] Dictionary<string, JsonElement>? parameters = null,
+        CancellationToken cancellationToken = default) =>
+        Serialize(await svc.ExplainAsync(new QueryRequest(dbName, sql, parameters), Agent(context), cancellationToken));
 
     // The agent HttpSecurity matched the bearer token to; null over stdio or without tokens.
     private static string? Agent(RequestContext<CallToolRequestParams> context) => context.User?.Identity?.Name;

@@ -405,10 +405,13 @@ public class QueryServiceIntegrationTests
 
     private const string KeyedTable = "sqlmcp_keyed";
     private const string View = "sqlmcp_fixture_v";
+    private const string ChildTable = "sqlmcp_child";
+    private const string ChildComment = "Rows that point at a keyed row";
+    private const string KeyedIdComment = "The keyed row this one belongs to";
 
     /// <summary>
-    /// Creates (once) a table with a primary key and a view for the schema tools, and
-    /// returns the schema they are in.
+    /// Creates (once) a table with a primary key, a view, and a commented table with a
+    /// foreign key to the first, for the schema tools, and returns the schema they are in.
     /// </summary>
     private static async Task<string> SeedSchemaAsync(DbConfig db)
     {
@@ -416,6 +419,30 @@ public class QueryServiceIntegrationTests
         await using var conn = await OpenAsync(db);
         await TryExecAsync(conn, $"CREATE TABLE {KeyedTable} (id INT NOT NULL PRIMARY KEY, label VARCHAR(30))");
         await TryExecAsync(conn, $"CREATE VIEW {View} AS SELECT id FROM {Table}");
+        if (await TryExecAsync(conn, $"CREATE TABLE {ChildTable} (id INT NOT NULL PRIMARY KEY, keyed_id INT, note VARCHAR(30), " +
+                                     $"CONSTRAINT sqlmcp_child_fk FOREIGN KEY (keyed_id) REFERENCES {KeyedTable} (id))"))
+        {
+            string[] comments = db.Provider switch
+            {
+                DbProvider.MySql =>
+                [
+                    $"ALTER TABLE {ChildTable} COMMENT = '{ChildComment}'",
+                    $"ALTER TABLE {ChildTable} MODIFY keyed_id INT COMMENT '{KeyedIdComment}'",
+                ],
+                DbProvider.SqlServer =>
+                [
+                    $"EXEC sys.sp_addextendedproperty N'MS_Description', N'{ChildComment}', N'SCHEMA', N'dbo', N'TABLE', N'{ChildTable}'",
+                    $"EXEC sys.sp_addextendedproperty N'MS_Description', N'{KeyedIdComment}', N'SCHEMA', N'dbo', N'TABLE', N'{ChildTable}', N'COLUMN', N'keyed_id'",
+                ],
+                _ =>
+                [
+                    $"COMMENT ON TABLE {ChildTable} IS '{ChildComment}'",
+                    $"COMMENT ON COLUMN {ChildTable}.keyed_id IS '{KeyedIdComment}'",
+                ],
+            };
+            foreach (var sql in comments)
+                await ExecAsync(conn, sql);
+        }
 
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = db.Provider switch
@@ -469,6 +496,98 @@ public class QueryServiceIntegrationTests
         Assert.True(label.Nullable);
         Assert.False(label.PrimaryKey);
         Assert.Contains("30", label.DataType);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Searches_tables_by_name_and_comment(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+        var schema = await SeedSchemaAsync(db);
+        var svc = Service(db);
+
+        async Task<string[]> Find(string search)
+        {
+            var result = await svc.ListTablesAsync("test", schema, search);
+            Assert.True(result.Error is null, result.Error);
+            return [.. result.Value!.Tables.Select(t => t.Name.ToLowerInvariant()).Order()];
+        }
+
+        // The child table's comment mentions a keyed row.
+        Assert.Equal([ChildTable, KeyedTable], await Find("KEYED"));
+        Assert.Equal([ChildTable], await Find("point at"));
+        // Wildcards in the search are matched as text.
+        Assert.Empty(await Find("sqlmcp%"));
+        Assert.Empty(await Find("sqlmcp[_]"));
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Describes_foreign_keys_in_both_directions(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+        var schema = await SeedSchemaAsync(db);
+        var svc = Service(db);
+
+        var child = await svc.DescribeTableAsync("test", ChildTable, schema);
+        Assert.True(child.Error is null, child.Error);
+        var key = Assert.Single(child.Value!.ForeignKeys);
+        Assert.Equal(["keyed_id"], key.Columns.Select(c => c.ToLowerInvariant()));
+        Assert.Equal($"{schema}.{KeyedTable}", key.ReferencedTable, ignoreCase: true);
+        Assert.Equal(["id"], key.ReferencedColumns.Select(c => c.ToLowerInvariant()));
+        Assert.Empty(child.Value.ReferencedBy);
+
+        var keyed = await svc.DescribeTableAsync("test", KeyedTable, schema);
+        Assert.Empty(keyed.Value!.ForeignKeys);
+        var incoming = Assert.Single(keyed.Value.ReferencedBy);
+        Assert.Equal($"{schema}.{ChildTable}", incoming.Table, ignoreCase: true);
+        Assert.Equal(["keyed_id"], incoming.Columns.Select(c => c.ToLowerInvariant()));
+        Assert.Equal(["id"], incoming.ReferencedColumns.Select(c => c.ToLowerInvariant()));
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Describes_table_and_column_comments(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+        var schema = await SeedSchemaAsync(db);
+        var svc = Service(db);
+
+        var child = (await svc.DescribeTableAsync("test", ChildTable, schema)).Value!;
+        Assert.Equal(ChildComment, child.Comment);
+        Assert.Equal(KeyedIdComment, child.Columns.Single(c => c.Name.Equals("keyed_id", StringComparison.OrdinalIgnoreCase)).Comment);
+        Assert.Null(child.Columns.Single(c => c.Name.Equals("note", StringComparison.OrdinalIgnoreCase)).Comment);
+
+        var listed = (await svc.ListTablesAsync("test", schema)).Value!.Tables;
+        Assert.Equal(ChildComment, listed.Single(t => t.Name.Equals(ChildTable, StringComparison.OrdinalIgnoreCase)).Comment);
+        Assert.Null(listed.Single(t => t.Name.Equals(KeyedTable, StringComparison.OrdinalIgnoreCase)).Comment);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Estimates_row_counts_from_statistics(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+        var schema = await SeedSchemaAsync(db);
+        await using (var conn = await OpenAsync(db))
+        {
+            var gather = provider switch
+            {
+                DbProvider.Postgres => $"ANALYZE {Table}",
+                DbProvider.MySql => $"ANALYZE TABLE {Table}",
+                DbProvider.Oracle => $"BEGIN DBMS_STATS.GATHER_TABLE_STATS(USER, '{Table.ToUpperInvariant()}'); END;",
+                _ => null
+            };
+            if (gather is not null)
+                await ExecAsync(conn, gather);
+        }
+
+        var tables = (await Service(db).ListTablesAsync("test", schema)).Value!.Tables;
+
+        Assert.Equal(3, tables.Single(t => t.Name.Equals(Table, StringComparison.OrdinalIgnoreCase)).ApproxRows);
+        Assert.Null(tables.Single(t => t.Name.Equals(View, StringComparison.OrdinalIgnoreCase)).ApproxRows);
+        var described = await Service(db).DescribeTableAsync("test", Table, schema);
+        Assert.Equal(3, described.Value!.ApproxRows);
     }
 
     // Oracle's test login is SYSTEM, an Oracle-maintained schema that's hidden unless named.
@@ -578,6 +697,26 @@ public class QueryServiceIntegrationTests
 
     [SkippableTheory]
     [MemberData(nameof(Providers))]
+    public async Task Leaves_out_foreign_keys_to_tables_the_login_cannot_read(DbProvider provider)
+    {
+        var admin = RequireDb(provider);
+        var schema = await SeedSchemaAsync(admin);
+        var (readOnly, table) = await ReadOnlyLoginAsync(admin);
+        await using (var conn = await OpenAsync(admin))
+        {
+            var grantee = provider == DbProvider.MySql ? $"'{ReadOnlyUser}'@'%'" : ReadOnlyUser;
+            await ExecAsync(conn, $"GRANT SELECT ON {table[..table.LastIndexOf('.')]}.{ChildTable} TO {grantee}");
+        }
+
+        var child = await Service(readOnly, allowWritableLogin: false).DescribeTableAsync("test", ChildTable, schema);
+
+        Assert.True(child.Error is null, child.Error);
+        Assert.Equal(3, child.Value!.Columns.Length);
+        Assert.Empty(child.Value.ForeignKeys);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
     public async Task Schema_tools_refuse_a_login_that_can_write(DbProvider provider)
     {
         var admin = RequireDb(provider);
@@ -626,6 +765,52 @@ public class QueryServiceIntegrationTests
             Assert.True(result.Error is null, $"{attack}: {result.Error}");
             Assert.Empty(result.Value!.Rows);
         }
+        Assert.Equal(3, await CountAsync(db));
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Explains_a_query_with_parameters(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+        await SeedAsync(db);
+
+        var result = await Service(db).ExplainAsync(Query(
+            $"SELECT id, name FROM {Table} WHERE id = {P(provider, "id")} AND name = {P(provider, "name")}", """{"id": 2, "name": "row 2"}"""));
+
+        Assert.True(result.Error is null, result.Error);
+        Assert.Contains(Table, result.Value!.Plan, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("rows", result.Value.Plan, StringComparison.OrdinalIgnoreCase); // the estimate
+    }
+
+    // Dividing by zero fails only when a row is read, so the plan shows the query didn't run.
+    [SkippableTheory]
+    [InlineData(DbProvider.Postgres)]
+    [InlineData(DbProvider.SqlServer)]
+    [InlineData(DbProvider.Oracle)]
+    public async Task Explains_without_running_the_query(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+        await SeedAsync(db);
+        var svc = Service(db);
+        var sql = $"SELECT 1 / (id - id) AS boom FROM {Table}";
+
+        Assert.NotNull((await svc.ExecuteAsync(new("test", sql))).Error);
+        var explained = await svc.ExplainAsync(new("test", sql));
+        Assert.True(explained.Error is null, explained.Error);
+        Assert.NotEmpty(explained.Value!.Plan);
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Providers))]
+    public async Task Explain_rejects_writes(DbProvider provider)
+    {
+        var db = RequireDb(provider);
+        await SeedAsync(db);
+
+        var result = await Service(db).ExplainAsync(new("test", $"DELETE FROM {Table}"));
+
+        Assert.Contains("Only SELECT", result.Error);
         Assert.Equal(3, await CountAsync(db));
     }
 
