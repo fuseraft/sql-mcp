@@ -1,6 +1,7 @@
 # sql-mcp
 
 [![CI](https://github.com/fuseraft/sql-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/fuseraft/sql-mcp/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/github/license/fuseraft/sql-mcp)](LICENSE)
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server that lets AI agents read your
 SQL Server, PostgreSQL, MySQL and Oracle databases, and nothing more. Every query is checked, run
@@ -83,3 +84,7 @@ fuseraft and tokens.
 shows how to start all four in containers. The docs site in `docs/` is built with
 [Starlight](https://starlight.astro.build): `npm install && npm run dev` there to preview, and
 pushes to `master` deploy it.
+
+## License
+
+MIT
