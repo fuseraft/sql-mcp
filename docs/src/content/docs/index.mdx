@@ -1,0 +1,71 @@
+---
+title: sql-mcp
+description: An MCP server that lets AI agents read SQL Server, PostgreSQL, MySQL and Oracle databases, and nothing more.
+template: splash
+hero:
+  tagline: An MCP server that lets AI agents read your SQL Server, PostgreSQL, MySQL and Oracle databases, and nothing more. Every query is checked, run in a transaction that is rolled back, and refused outright if the login could write.
+  image:
+    file: ../../assets/sql-mcp.svg
+  actions:
+    - text: Get started
+      link: /sql-mcp/start/quickstart/
+      icon: right-arrow
+    - text: View on GitHub
+      link: https://github.com/fuseraft/sql-mcp
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+```json
+// describe_table, as an agent sees it
+{
+  "schema": "sales", "name": "orders", "type": "table",
+  "comment": "One row per order placed", "approxRows": 1250000,
+  "columns": [
+    { "name": "id", "dataType": "integer", "nullable": false, "primaryKey": true },
+    { "name": "customer_id", "dataType": "integer", "nullable": false, "primaryKey": false },
+    { "name": "status", "dataType": "smallint", "nullable": false, "primaryKey": false,
+      "comment": "1 open, 2 shipped, 3 cancelled" }
+  ],
+  "foreignKeys": [
+    { "columns": ["customer_id"], "referencedTable": "sales.customers", "referencedColumns": ["id"] }
+  ],
+  "referencedBy": [
+    { "table": "sales.order_lines", "columns": ["order_id"], "referencedColumns": ["id"] }
+  ]
+}
+```
+
+<CardGrid stagger>
+	<Card title="Read-only, three times over" icon="approve-check">
+		Each query must be a single `SELECT`, checked with the database's own rules for quotes and
+		comments. It runs in a transaction that is always rolled back, read-only where the database
+		supports it. And a database whose login could write is refused altogether.
+	</Card>
+	<Card title="Four databases" icon="list-format">
+		SQL Server, PostgreSQL, MySQL and Oracle, side by side in one server. Agents see each
+		database's provider, so they write the right dialect the first time.
+	</Card>
+	<Card title="Schema context for agents" icon="open-book">
+		Foreign keys in both directions, table and column comments, and estimated row counts. Agents
+		take join columns from the schema instead of guessing from names.
+	</Card>
+	<Card title="Results that fit in a context" icon="document">
+		Rows come back as compact arrays, capped by count and size. A cut-off result says why, and
+		how to narrow or page the query in that database's syntax.
+	</Card>
+	<Card title="Look before you query" icon="magnifier">
+		`explain_query` returns the estimated plan without running anything, so an agent can spot a
+		full scan of a large table first. `list_tables` searches names and comments.
+	</Card>
+	<Card title="Every call attributed" icon="seti:lock">
+		Each agent gets its own bearer token, and every call is logged under its name, with the SQL,
+		timing and row count. Refused calls are logged too.
+	</Card>
+	<Card title="Runs where you need it" icon="setting">
+		stdio for a client that launches it, or Streamable HTTP as a shared service in Docker, under
+		systemd or as a Windows Service, with liveness and readiness checks.
+	</Card>
+</CardGrid>
